@@ -1,4 +1,4 @@
-// V3
+// V4
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -45,6 +45,7 @@ bool connecting = false;
 
 unsigned long lastRetryTime = 0;
 const unsigned long RETRY_INTERVAL = 5000;  // 5 seconds between retries
+bool retryPending = false;
 
 // ---------- Logging System ----------
 #define MAX_LOG_ENTRIES 200
@@ -92,6 +93,33 @@ int16_t clamp(int16_t v, int16_t minv, int16_t maxv) {
   return v;
 }
 
+String jsonEscape(const String& input) {
+  String out;
+  out.reserve(input.length() + 8);
+  for (size_t i = 0; i < input.length(); ++i) {
+    char c = input.charAt(i);
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"':  out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      default:
+        if ((uint8_t)c < 0x20) {
+          char buf[7];
+          snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+          out += buf;
+        } else {
+          out += c;
+        }
+        break;
+    }
+  }
+  return out;
+}
+
 void applyModifiers() {
   if (ctrlPressed) Keyboard.press(KEY_LEFT_CTRL);
   else Keyboard.release(KEY_LEFT_CTRL);
@@ -128,6 +156,12 @@ void loadSettings() {
   repeatInterval = preferences.getInt("repeat", 100);
   legacyMode = preferences.getBool("legacy", false);
   preferences.end();
+
+  if (sensitivity < 0.1f) sensitivity = 0.1f;
+  if (sensitivity > 10.0f) sensitivity = 10.0f;
+  if (repeatInterval < 20) repeatInterval = 20;
+  if (repeatInterval > 1000) repeatInterval = 1000;
+
   LOG_INFO("Settings loaded: sens=%.1f, repeat=%d, legacy=%d", sensitivity, repeatInterval, legacyMode);
 }
 
@@ -141,38 +175,50 @@ void saveSettings() {
 }
 
 // ---------- WiFi STA management ----------
-void updateSTAStatus() {
+void setSTAErrorFromStatus() {
+  wl_status_t status = WiFi.status();
+  switch (status) {
+    case WL_NO_SSID_AVAIL: sta_error = "SSID not found"; break;
+    case WL_CONNECT_FAILED: sta_error = "Connection failed"; break;
+#ifdef WL_WRONG_PASSWORD
+    case WL_WRONG_PASSWORD: sta_error = "Wrong password"; break;
+#endif
+    case WL_IDLE_STATUS: sta_error = "Idle"; break;
+    case WL_DISCONNECTED: sta_error = "Disconnected"; break;
+#ifdef WL_CONNECTION_LOST
+    case WL_CONNECTION_LOST: sta_error = "Connection lost"; break;
+#endif
+    default: sta_error = "Unknown error"; break;
+  }
+}
+
+void updateSTAStatus(bool logStatus = false) {
   if (WiFi.status() == WL_CONNECTED) {
+    bool changed = (sta_status != "Connected" || sta_ip != WiFi.localIP().toString() || sta_ssid != WiFi.SSID());
     sta_status = "Connected";
     sta_ip = WiFi.localIP().toString();
     sta_ssid = WiFi.SSID();
     sta_error = "";
     connecting = false;
+    retryPending = false;
     sta_retry_count = 0;
-    LOG_SUCCESS("STA connected to %s, IP %s", sta_ssid.c_str(), sta_ip.c_str());
+    if (logStatus || changed) {
+      LOG_SUCCESS("STA connected to %s, IP %s", sta_ssid.c_str(), sta_ip.c_str());
+    }
   } else {
-    sta_status = "Disconnected";
+    sta_status = connecting ? "Connecting..." : (retryPending ? "Retrying..." : "Disconnected");
     sta_ip = "";
     sta_ssid = "";
-    wl_status_t status = WiFi.status();
-    switch (status) {
-      case WL_NO_SSID_AVAIL: sta_error = "SSID not found"; break;
-      case WL_CONNECT_FAILED: sta_error = "Connection failed"; break;
-#ifdef WL_WRONG_PASSWORD
-      case WL_WRONG_PASSWORD: sta_error = "Wrong password"; break;
-#endif
-      case WL_IDLE_STATUS: sta_error = "Idle"; break;
-      case WL_DISCONNECTED: sta_error = "Disconnected"; break;
-#ifdef WL_CONNECTION_LOST
-      case WL_CONNECTION_LOST: sta_error = "Connection lost"; break;
-#endif
-      default: sta_error = "Unknown error"; break;
+    setSTAErrorFromStatus();
+    if (retryPending) {
+      sta_error = "Retry scheduled";
     }
-    if (connecting && (millis() - connectStartTime > CONNECT_TIMEOUT)) {
+    if (connecting && millis() - connectStartTime > CONNECT_TIMEOUT) {
       sta_error = "Connection timeout";
-      connecting = false;
     }
-    LOG_WARN("STA status: %s, error: %s", sta_status.c_str(), sta_error.c_str());
+    if (logStatus) {
+      LOG_WARN("STA status: %s, error: %s", sta_status.c_str(), sta_error.c_str());
+    }
   }
 }
 
@@ -180,64 +226,93 @@ void WiFiEvent(WiFiEvent_t event) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       sta_status = "Connecting...";
-      LOG_INFO("STA connected to AP");
+      sta_error = "Connected, waiting for IP...";
+      LOG_INFO("STA connected to AP, waiting for IP");
       break;
+
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      updateSTAStatus();
+      updateSTAStatus(true);
       break;
+
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      updateSTAStatus();
-      LOG_WARN("STA disconnected");
+      if (!retryPending) {
+        sta_status = connecting ? "Connecting..." : "Disconnected";
+        setSTAErrorFromStatus();
+      }
+      LOG_WARN("STA disconnected: %s", sta_error.c_str());
       break;
-    default: break;
+
+    default:
+      break;
   }
 }
 
-void connectSTA(String ssid, String password, bool hidden, String bssid_str) {
+bool parseBSSID(const String& text, uint8_t out[6]) {
+  if (text.length() != 17) return false;
+  unsigned int b[6];
+  if (sscanf(text.c_str(), "%2x:%2x:%2x:%2x:%2x:%2x",
+             &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+    return false;
+  }
+  for (int i = 0; i < 6; ++i) out[i] = (uint8_t)b[i];
+  return true;
+}
+
+void connectSTA(String ssid, String password, bool hidden, String bssid_str, bool resetRetries = true) {
   if (ssid.length() == 0) {
     LOG_ERROR("connectSTA called with empty SSID");
     return;
   }
 
-  // Prevent re-entrancy: if we're already connected or connecting, abort
-  if (connecting || WiFi.status() == WL_CONNECTED) {
-    LOG_WARN("connectSTA aborted: already connecting or connected");
+  if (WiFi.status() == WL_CONNECTED) {
+    LOG_WARN("connectSTA aborted: already connected");
     return;
   }
 
-  // Force a clean stop of any ongoing connection
+  if (connecting) {
+    LOG_WARN("connectSTA aborted: connection already in progress");
+    return;
+  }
+
+  if (resetRetries) {
+    sta_retry_count = 0;
+    retryPending = false;
+  }
+
+  // Cancel any completed scan results before changing STA state.
+  int scanState = WiFi.scanComplete();
+  if (scanState >= 0) {
+    WiFi.scanDelete();
+  }
+  scanInProgress = false;
+
   WiFi.disconnect(true);
   delay(100);
+  WiFi.mode(WIFI_AP_STA);
 
-  // Save credentials
   preferences.begin("wifi", false);
   preferences.putString("ssid", ssid);
   preferences.putString("pass", password);
   preferences.putBool("hidden", hidden);
-  if (hidden) {
-    preferences.putString("bssid", bssid_str);
-  } else {
-    preferences.putString("bssid", "");
-  }
+  preferences.putString("bssid", hidden ? bssid_str : "");
   preferences.end();
 
-  WiFi.mode(WIFI_AP_STA);
   connecting = true;
+  retryPending = false;
   connectStartTime = millis();
-  sta_retry_count = 0;
+  lastRetryTime = millis();
   sta_error = "Connecting...";
+  sta_status = "Connecting...";
 
-  LOG_INFO("Connecting to STA: %s (hidden=%d, bssid=%s)", ssid.c_str(), hidden, bssid_str.c_str());
+  LOG_INFO("Connecting to STA: %s (hidden=%d, bssid=%s, attempt=%d)",
+           ssid.c_str(), hidden, bssid_str.c_str(), sta_retry_count + 1);
 
   if (hidden && bssid_str.length() > 0) {
     uint8_t bssid[6];
-    int count = sscanf(bssid_str.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                       &bssid[0], &bssid[1], &bssid[2],
-                       &bssid[3], &bssid[4], &bssid[5]);
-    if (count == 6) {
+    if (parseBSSID(bssid_str, bssid)) {
       WiFi.begin(ssid.c_str(), password.c_str(), 0, bssid);
     } else {
-      LOG_ERROR("Invalid BSSID format: %s", bssid_str.c_str());
+      LOG_WARN("Invalid BSSID format: %s; connecting without BSSID", bssid_str.c_str());
       WiFi.begin(ssid.c_str(), password.c_str());
     }
   } else {
@@ -254,18 +329,25 @@ void loadSTAConfig() {
   preferences.end();
   if (ssid.length() > 0) {
     LOG_INFO("Loading saved STA config: %s", ssid.c_str());
-    connectSTA(ssid, pass, hidden, bssid);
+    connectSTA(ssid, pass, hidden, bssid, true);
   } else {
     LOG_INFO("No saved STA config found");
   }
 }
 
 void disconnectSTA() {
-  WiFi.disconnect();
-  WiFi.mode(WIFI_AP);
+  retryPending = false;
   connecting = false;
   sta_retry_count = 0;
-  updateSTAStatus();
+  scanInProgress = false;
+  int scanState = WiFi.scanComplete();
+  if (scanState >= 0) WiFi.scanDelete();
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP);
+  sta_status = "Disconnected";
+  sta_ip = "";
+  sta_ssid = "";
+  sta_error = "Disconnected";
   LOG_INFO("STA disconnected manually");
 }
 
@@ -288,7 +370,6 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
       dx = clamp(dx, -127, 127);
       dy = clamp(dy, -127, 127);
       Mouse.move(dx, dy, 0);
-      LOG_INFO("WebSocket move dx=%d dy=%d", dx, dy);
     } else {
       LOG_WARN("WebSocket received unknown message: %s", msg.c_str());
     }
@@ -306,7 +387,6 @@ void handleMove() {
   dx = clamp(dx, -127, 127);
   dy = clamp(dy, -127, 127);
   Mouse.move(dx, dy, 0);
-  LOG_INFO("Mouse move dx=%d dy=%d", dx, dy);
   server.send(200, "text/plain", "OK");
 }
 
@@ -543,10 +623,10 @@ void handleResetModifiers() {
 void handleSTAStatus() {
   String json = "{";
   json += "\"connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
-  json += ",\"ssid\":\"" + sta_ssid + "\"";
-  json += ",\"ip\":\"" + sta_ip + "\"";
-  json += ",\"status\":\"" + sta_status + "\"";
-  json += ",\"error\":\"" + sta_error + "\"";
+  json += ",\"ssid\":\"" + jsonEscape(sta_ssid) + "\"";
+  json += ",\"ip\":\"" + jsonEscape(sta_ip) + "\"";
+  json += ",\"status\":\"" + jsonEscape(sta_status) + "\"";
+  json += ",\"error\":\"" + jsonEscape(sta_error) + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -554,27 +634,25 @@ void handleSTAStatus() {
 void handleSTAScan() {
   int n = WiFi.scanComplete();
 
-  // --------------------------------------------------
-  // Scan is currently running
-  // --------------------------------------------------
   if (n == WIFI_SCAN_RUNNING) {
     scanInProgress = true;
     server.send(200, "application/json", "{\"scanning\":true}");
     return;
   }
 
-  // --------------------------------------------------
-  // Scan failed / no scan exists -> start async scan
-  // --------------------------------------------------
   if (n == WIFI_SCAN_FAILED) {
     if (!scanInProgress) {
+      WiFi.mode(WIFI_AP_STA);
       scanInProgress = true;
 
       LOG_INFO("Starting WiFi scan...");
-
-      // Do NOT disconnect WiFi here.
-      // AP+STA can scan while the AP remains active.
-      WiFi.scanNetworks(true);
+      int result = WiFi.scanNetworks(true, true);
+      if (result == WIFI_SCAN_FAILED) {
+        scanInProgress = false;
+        LOG_ERROR("Failed to start WiFi scan");
+        server.send(503, "application/json", "{\"error\":\"WiFi scan failed to start\"}");
+        return;
+      }
 
       server.send(200, "application/json", "{\"scanning\":true}");
       return;
@@ -582,20 +660,15 @@ void handleSTAScan() {
 
     scanInProgress = false;
     LOG_ERROR("WiFi scan failed");
-
-    server.send(200, "application/json",
-                "{\"error\":\"WiFi scan failed\"}");
+    server.send(503, "application/json", "{\"error\":\"WiFi scan failed\"}");
     return;
   }
 
-  // --------------------------------------------------
-  // Scan completed
-  // n >= 0
-  // --------------------------------------------------
   if (n >= 0) {
     String json = "[";
+    json.reserve((size_t)n * 110 + 4);
 
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; ++i) {
       if (i > 0) json += ",";
 
       String ssid = WiFi.SSID(i);
@@ -604,67 +677,42 @@ void handleSTAScan() {
       wifi_auth_mode_t encryption = WiFi.encryptionType(i);
 
       String encType;
-
       switch (encryption) {
-        case WIFI_AUTH_OPEN:
-          encType = "Open";
-          break;
-
-        case WIFI_AUTH_WEP:
-          encType = "WEP";
-          break;
-
-        case WIFI_AUTH_WPA_PSK:
-          encType = "WPA";
-          break;
-
-        case WIFI_AUTH_WPA2_PSK:
-          encType = "WPA2";
-          break;
-
-        case WIFI_AUTH_WPA_WPA2_PSK:
-          encType = "WPA/WPA2";
-          break;
-
-        case WIFI_AUTH_WPA2_ENTERPRISE:
-          encType = "WPA2-Enterprise";
-          break;
-
-        default:
-          encType = "Unknown";
-          break;
+        case WIFI_AUTH_OPEN: encType = "Open"; break;
+        case WIFI_AUTH_WEP: encType = "WEP"; break;
+        case WIFI_AUTH_WPA_PSK: encType = "WPA"; break;
+        case WIFI_AUTH_WPA2_PSK: encType = "WPA2"; break;
+        case WIFI_AUTH_WPA_WPA2_PSK: encType = "WPA/WPA2"; break;
+        case WIFI_AUTH_WPA2_ENTERPRISE: encType = "WPA2-Enterprise"; break;
+#ifdef WIFI_AUTH_WPA3_PSK
+        case WIFI_AUTH_WPA3_PSK: encType = "WPA3"; break;
+#endif
+#ifdef WIFI_AUTH_WPA2_WPA3_PSK
+        case WIFI_AUTH_WPA2_WPA3_PSK: encType = "WPA2/WPA3"; break;
+#endif
+        default: encType = "Unknown"; break;
       }
 
-      json += "{";
-      json += "\"ssid\":\"" + ssid + "\",";
+      json += "{\"ssid\":\"" + jsonEscape(ssid) + "\",";
       json += "\"rssi\":" + String(rssi) + ",";
       json += "\"encryption\":" + String((int)encryption) + ",";
-      json += "\"bssid\":\"" + bssid + "\",";
-      json += "\"encryption_str\":\"" + encType + "\"";
-      json += "}";
+      json += "\"bssid\":\"" + jsonEscape(bssid) + "\",";
+      json += "\"encryption_str\":\"" + jsonEscape(encType) + "\"}";
     }
 
     json += "]";
 
     LOG_INFO("WiFi scan completed, %d networks found", n);
-
     scanInProgress = false;
-
     WiFi.scanDelete();
 
     server.send(200, "application/json", json);
     return;
   }
 
-  // --------------------------------------------------
-  // Unexpected state
-  // --------------------------------------------------
   scanInProgress = false;
-
   LOG_ERROR("Unexpected WiFi scan state: %d", n);
-
-  server.send(500, "application/json",
-              "{\"error\":\"Unexpected scan state\"}");
+  server.send(500, "application/json", "{\"error\":\"Unexpected scan state\"}");
 }
 
 void handleSTAConnect() {
@@ -680,7 +728,11 @@ void handleSTAConnect() {
     return;
   }
   LOG_INFO("STA connect request: ssid=%s, hidden=%d, bssid=%s", ssid.c_str(), hidden, bssid.c_str());
-  connectSTA(ssid, password, hidden, bssid);
+  if (connecting || WiFi.status() == WL_CONNECTED) {
+    server.send(409, "text/plain", "STA already connected or connecting");
+    return;
+  }
+  connectSTA(ssid, password, hidden, bssid, true);
   server.send(200, "text/plain", "OK");
 }
 
@@ -705,8 +757,8 @@ void handleLogs() {
     if (i) json += ",";
     json += "{";
     json += "\"timestamp\":" + String(logBuffer[idx].timestamp);
-    json += ",\"level\":\"" + String(logBuffer[idx].level) + "\"";
-    json += ",\"message\":\"" + String(logBuffer[idx].message) + "\"";
+    json += ",\"level\":\"" + jsonEscape(String(logBuffer[idx].level)) + "\"";
+    json += ",\"message\":\"" + jsonEscape(String(logBuffer[idx].message)) + "\"";
     json += "}";
   }
   json += "]";
@@ -919,9 +971,9 @@ const char index_html[] PROGMEM = R"rawliteral(
       <button class="accent" onclick="sendHTTP('/double?btn=left')">Double</button>
     </div>
     <div class="btn-group">
-      <button id="mouseLeftDown" class="mouse-down" data-btn="left" onclick="mouseDown('left')">L⬇</button>
+      <button id="mouseLeftDown" class="mouse-down" data-btn="left">L⬇</button>
       <button id="mouseLeftUp"   class="mouse-up"   data-btn="left" onclick="mouseUp('left')">L⬆</button>
-      <button id="mouseRightDown" class="mouse-down" data-btn="right" onclick="mouseDown('right')">R⬇</button>
+      <button id="mouseRightDown" class="mouse-down" data-btn="right">R⬇</button>
       <button id="mouseRightUp"   class="mouse-up"   data-btn="right" onclick="mouseUp('right')">R⬆</button>
       <button onclick="sendHTTP('/wheel?delta=-1')">⬆</button>
       <button onclick="sendHTTP('/wheel?delta=1')">⬇</button>
@@ -1006,9 +1058,10 @@ function connectWS() {
 connectWS();
 
 function sendHTTP(url) {
-  fetch(url).then(res => {
+  fetch(url, {cache: 'no-store'}).then(res => {
     if (!res.ok) logWarn('HTTP ' + res.status + ' for ' + url);
     else logInfo('HTTP OK: ' + url);
+    return res;
   }).catch(err => logError('Fetch failed: ' + err.message));
 }
 
@@ -1024,17 +1077,25 @@ function sendMove(dx, dy) {
 
 // ========== SETTINGS ==========
 let sens = 2.0, repeatInterval = 100, legacyMode = false;
+let sensSaveTimer = null;
+let repeatSaveTimer = null;
 
 document.getElementById('sens').addEventListener('input', function() {
   sens = parseFloat(this.value);
   document.getElementById('sensVal').textContent = sens.toFixed(1);
-  sendHTTP('/set_sensitivity?value=' + sens);
+  clearTimeout(sensSaveTimer);
+  sensSaveTimer = setTimeout(() => {
+    sendHTTP('/set_sensitivity?value=' + encodeURIComponent(sens));
+  }, 400);
   logInfo('Sensitivity = ' + sens);
 });
 document.getElementById('repeatRate').addEventListener('input', function() {
   repeatInterval = parseInt(this.value);
   document.getElementById('repeatVal').textContent = repeatInterval;
-  sendHTTP('/set_repeat?value=' + repeatInterval);
+  clearTimeout(repeatSaveTimer);
+  repeatSaveTimer = setTimeout(() => {
+    sendHTTP('/set_repeat?value=' + encodeURIComponent(repeatInterval));
+  }, 400);
   logInfo('Repeat interval = ' + repeatInterval);
 });
 document.getElementById('legacyCheck').addEventListener('change', function() {
@@ -1090,17 +1151,25 @@ pad.addEventListener('pointerup', (e) => {
   e.preventDefault();
 });
 pad.addEventListener('pointercancel', (e) => { padDown = false; });
+pad.addEventListener('lostpointercapture', () => { padDown = false; });
 
 // ========== ARROW REPEAT ==========
 let repeatTimer = null;
+function stopArrowRepeat() {
+  clearInterval(repeatTimer);
+  repeatTimer = null;
+}
 document.querySelectorAll('.arrow-row button[data-dx]').forEach(btn => {
   const dx = parseInt(btn.dataset.dx), dy = parseInt(btn.dataset.dy);
-  btn.addEventListener('pointerdown', () => {
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    clearInterval(repeatTimer);
     sendMove(dx, dy);
     repeatTimer = setInterval(() => sendMove(dx, dy), repeatInterval);
   });
-  btn.addEventListener('pointerup', () => { clearInterval(repeatTimer); repeatTimer = null; });
-  btn.addEventListener('pointerleave', () => { clearInterval(repeatTimer); repeatTimer = null; });
+  btn.addEventListener('pointerup', stopArrowRepeat);
+  btn.addEventListener('pointercancel', stopArrowRepeat);
+  btn.addEventListener('pointerleave', stopArrowRepeat);
 });
 
 // ========== MOUSE HOLD STATE ==========
@@ -1112,27 +1181,92 @@ function updateMouseUI() {
 }
 
 function mouseDown(btn) {
-  if (btn === 'left') { mouseState.left = true; sendHTTP('/down?btn=left'); }
-  else if (btn === 'right') { mouseState.right = true; sendHTTP('/down?btn=right'); }
+  if (btn === 'left' && !mouseState.left) { mouseState.left = true; sendHTTP('/down?btn=left'); }
+  else if (btn === 'right' && !mouseState.right) { mouseState.right = true; sendHTTP('/down?btn=right'); }
   updateMouseUI();
 }
 
 function mouseUp(btn) {
-  if (btn === 'left') { mouseState.left = false; sendHTTP('/up?btn=left'); }
-  else if (btn === 'right') { mouseState.right = false; sendHTTP('/up?btn=right'); }
+  if (btn === 'left' && mouseState.left) { mouseState.left = false; sendHTTP('/up?btn=left'); }
+  else if (btn === 'right' && mouseState.right) { mouseState.right = false; sendHTTP('/up?btn=right'); }
   updateMouseUI();
 }
 
+function releaseMouseButtons() {
+  if (mouseState.left) sendHTTP('/up?btn=left');
+  if (mouseState.right) sendHTTP('/up?btn=right');
+  mouseState.left = false;
+  mouseState.right = false;
+  updateMouseUI();
+}
+
+document.getElementById('mouseLeftDown').addEventListener('pointerdown', e => {
+  e.preventDefault();
+  e.currentTarget.setPointerCapture?.(e.pointerId);
+  mouseDown('left');
+});
+document.getElementById('mouseLeftDown').addEventListener('pointerup', e => { e.preventDefault(); mouseUp('left'); });
+document.getElementById('mouseLeftDown').addEventListener('pointercancel', () => mouseUp('left'));
+document.getElementById('mouseRightDown').addEventListener('pointerdown', e => {
+  e.preventDefault();
+  e.currentTarget.setPointerCapture?.(e.pointerId);
+  mouseDown('right');
+});
+document.getElementById('mouseRightDown').addEventListener('pointerup', e => { e.preventDefault(); mouseUp('right'); });
+document.getElementById('mouseRightDown').addEventListener('pointercancel', () => mouseUp('right'));
+
 // ========== MODIFIERS ==========
 const modState = { CTRL: false, ALT: false, SHIFT: false, WIN: false };
+const heldKeyCounts = new Map();
+
 document.querySelectorAll('#modButtons button').forEach(btn => {
   btn.addEventListener('click', () => {
     const mod = btn.dataset.mod;
     modState[mod] = !modState[mod];
     btn.classList.toggle('mod-active', modState[mod]);
-    sendHTTP('/toggle_modifier?mod=' + mod);
+    sendHTTP('/toggle_modifier?mod=' + encodeURIComponent(mod));
     logInfo('Sticky ' + mod + ' = ' + modState[mod]);
   });
+});
+
+function holdKey(code) {
+  const count = heldKeyCounts.get(code) || 0;
+  heldKeyCounts.set(code, count + 1);
+}
+
+function releaseKey(code) {
+  const count = heldKeyCounts.get(code) || 0;
+  if (count <= 1) {
+    heldKeyCounts.delete(code);
+    sendHTTP('/key_up?key=' + encodeURIComponent(code));
+  } else {
+    heldKeyCounts.set(code, count - 1);
+  }
+}
+
+function releaseHeldKeys() {
+  heldKeyCounts.forEach((count, code) => {
+    if (count > 0) sendHTTP('/key_up?key=' + encodeURIComponent(code));
+  });
+  heldKeyCounts.clear();
+  document.querySelectorAll('.mod-down').forEach(el => el.classList.remove('mod-down'));
+  sendHTTP('/reset_modifiers');
+  Object.keys(modState).forEach(k => modState[k] = false);
+  document.querySelectorAll('#modButtons button').forEach(btn => btn.classList.remove('mod-active'));
+  logInfo('All held keys/modifiers released');
+}
+
+window.addEventListener('blur', () => {
+  stopArrowRepeat();
+  releaseMouseButtons();
+  releaseHeldKeys();
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopArrowRepeat();
+    releaseMouseButtons();
+    releaseHeldKeys();
+  }
 });
 
 // ========== KEYBOARD LAYOUT ==========
@@ -1252,7 +1386,8 @@ function buildKeyboard() {
           const code = keyMap[label];
 
           if (code) {
-            sendHTTP('/key_down?key=' + code);
+            sendHTTP('/key_down?key=' + encodeURIComponent(code));
+            holdKey(code);
             el.classList.add('mod-down');
           }
         });
@@ -1263,7 +1398,8 @@ function buildKeyboard() {
           const code = keyMap[label];
 
           if (code) {
-            sendHTTP('/key_up?key=' + code);
+            sendHTTP('/key_up?key=' + encodeURIComponent(code));
+            releaseKey(code);
             el.classList.remove('mod-down');
           }
         });
@@ -1273,7 +1409,8 @@ function buildKeyboard() {
             const code = keyMap[label];
 
             if (code) {
-              sendHTTP('/key_up?key=' + code);
+              sendHTTP('/key_up?key=' + encodeURIComponent(code));
+              releaseKey(code);
             }
 
             el.classList.remove('mod-down');
@@ -1305,6 +1442,15 @@ function buildKeyboard() {
     grid.appendChild(rowEl);
   });
 }
+
+// ========== NUMPAD ==========
+const numpadLayout = [
+  ['NumLock', 'Num /', 'Num *', 'Num -'],
+  ['7',       '8',     '9',     'Num +'],
+  ['4',       '5',     '6',     'Num +'],
+  ['1',       '2',     '3',     'Num Enter'],
+  ['0',       '0',     '.',     'Num Enter']
+];
 
 function buildNumpad() {
   const container = document.getElementById('numpad');
@@ -1351,7 +1497,8 @@ function buildNumpad() {
         const code = keyMap[label];
 
         if (code) {
-          sendHTTP('/key_down?key=' + code);
+          sendHTTP('/key_down?key=' + encodeURIComponent(code));
+          holdKey(code);
           el.classList.add('mod-down');
         }
       });
@@ -1362,7 +1509,8 @@ function buildNumpad() {
         const code = keyMap[label];
 
         if (code) {
-          sendHTTP('/key_up?key=' + code);
+          sendHTTP('/key_up?key=' + encodeURIComponent(code));
+          releaseKey(code);
           el.classList.remove('mod-down');
         }
       });
@@ -1372,7 +1520,8 @@ function buildNumpad() {
           const code = keyMap[label];
 
           if (code) {
-            sendHTTP('/key_up?key=' + code);
+            sendHTTP('/key_up?key=' + encodeURIComponent(code));
+            releaseKey(code);
           }
 
           el.classList.remove('mod-down');
@@ -1461,6 +1610,7 @@ realInput.addEventListener('input', function() {
 // ========== TEST ==========
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function testAll() {
+  releaseHeldKeys();
   logInfo('=== Starting test ===');
   sendHTTP('/click?btn=left'); await sleep(200);
   sendHTTP('/click?btn=right'); await sleep(200);
@@ -1576,43 +1726,68 @@ const MAX_SCAN_ATTEMPTS = 10;
 function scanNetworks() {
   const listDiv = document.getElementById('networkList');
   listDiv.innerHTML = '<div class="scanning-msg">Scanning...</div>';
-  fetch('/sta/scan')
+
+  fetch('/sta/scan', {cache: 'no-store'})
     .then(r => r.json())
     .then(data => {
-      if (data.scanning) {
-        // Still scanning – retry after 2 seconds
+      if (data && data.scanning) {
         listDiv.innerHTML = '<div class="scanning-msg">Scanning, please wait...</div>';
         if (++scanAttempts < MAX_SCAN_ATTEMPTS) {
           setTimeout(scanNetworks, 2000);
         } else {
-          listDiv.innerHTML = '<div class="scanning-msg error-msg">Scan timed out. <a href="javascript:scanNetworks()">Retry</a></div>';
-          scanAttempts = 0;
+          listDiv.innerHTML = '<div class="scanning-msg error-msg">Scan timed out. <a href="#" id="retryScan">Retry</a></div>';
+          document.getElementById('retryScan')?.addEventListener('click', e => { e.preventDefault(); scanAttempts = 0; scanNetworks(); });
         }
         return;
       }
-      // Scan completed – check if we got an array
+
+      if (!Array.isArray(data)) {
+        throw new Error((data && data.error) || 'Invalid scan response');
+      }
+
       if (data.length === 0) {
         listDiv.innerHTML = '<div class="scanning-msg">No networks found. Make sure you are in range.</div>';
         scanAttempts = 0;
         return;
       }
-      // Build the network list
-      let html = '';
+
+      listDiv.innerHTML = '';
       data.forEach(net => {
-        const ssid = net.ssid || '(hidden)';
-        html += `<div class="network-item" onclick="selectNetwork('${ssid.replace(/'/g, "\\'")}', '${net.bssid}')">
-          <span><strong>${ssid}</strong> <span class="bssid">(${net.bssid})</span></span>
-          <span>
-            <span class="enc">${net.encryption_str}</span>
-            <span class="rssi">RSSI: ${net.rssi}</span>
-          </span>
-        </div>`;
+        const item = document.createElement('div');
+        item.className = 'network-item';
+
+        const left = document.createElement('span');
+        const name = document.createElement('strong');
+        name.textContent = net.ssid || '(hidden)';
+        left.appendChild(name);
+
+        const bssid = document.createElement('span');
+        bssid.className = 'bssid';
+        bssid.textContent = ' (' + (net.bssid || '') + ')';
+        left.appendChild(bssid);
+
+        const right = document.createElement('span');
+        const enc = document.createElement('span');
+        enc.className = 'enc';
+        enc.textContent = net.encryption_str || 'Unknown';
+        right.appendChild(enc);
+
+        const rssi = document.createElement('span');
+        rssi.className = 'rssi';
+        rssi.textContent = ' RSSI: ' + net.rssi;
+        right.appendChild(rssi);
+
+        item.appendChild(left);
+        item.appendChild(right);
+        item.addEventListener('click', () => selectNetwork(net.ssid || '', net.bssid || ''));
+        listDiv.appendChild(item);
       });
-      listDiv.innerHTML = html;
       scanAttempts = 0;
     })
-    .catch(() => {
-      listDiv.innerHTML = '<div class="scanning-msg error-msg">Error scanning. <a href="javascript:scanNetworks()">Retry</a></div>';
+    .catch(err => {
+      listDiv.innerHTML = '<div class="scanning-msg error-msg">Error scanning. <a href="#" id="retryScan">Retry</a></div>';
+      document.getElementById('retryScan')?.addEventListener('click', e => { e.preventDefault(); scanAttempts = 0; scanNetworks(); });
+      console.error(err);
     });
 }
 
@@ -1679,10 +1854,11 @@ void setup() {
   Serial.begin(115200);
   LOG_INFO("ESP32 HID Controller starting...");
 
-  // USB HID
+  // USB HID – correct order: USB first, then HID devices
+  USB.begin();
+  delay(100);               // Let the host detect the device
   Mouse.begin();
   Keyboard.begin();
-  USB.begin();
   LOG_INFO("USB HID initialized");
 
   // Load persistent settings
@@ -1745,34 +1921,45 @@ void loop() {
   server.handleClient();
   webSocket.loop();
 
-  // STA retry logic
+  // STA timeout + scheduled retry logic.
   if (connecting && WiFi.status() != WL_CONNECTED) {
     if (millis() - connectStartTime > CONNECT_TIMEOUT) {
+      connecting = false;
+
       if (sta_retry_count < MAX_RETRIES) {
         sta_retry_count++;
-        sta_error = "Timeout, retry " + String(sta_retry_count) + "/" + String(MAX_RETRIES);
-        LOG_WARN("STA connection timeout, retry %d/%d", sta_retry_count, MAX_RETRIES);
-
-        // allow a new connection by clearing 'connecting'
-        connecting = false;
-
-        preferences.begin("wifi", true);
-        String ssid = preferences.getString("ssid", "");
-        String pass = preferences.getString("pass", "");
-        bool hidden = preferences.getBool("hidden", false);
-        String bssid = preferences.getString("bssid", "");
-        preferences.end();
-
-        if (ssid.length() > 0) {
-          connectSTA(ssid, pass, hidden, bssid);
-        } else {
-          sta_error = "No saved credentials";
-          LOG_ERROR("No saved credentials for retry");
-        }
+        retryPending = true;
+        lastRetryTime = millis();
+        sta_status = "Retrying...";
+        sta_error = "Retry " + String(sta_retry_count) + "/" + String(MAX_RETRIES) + " in " + String(RETRY_INTERVAL / 1000) + "s";
+        LOG_WARN("STA connection timeout; retry %d/%d scheduled in %lu ms",
+                 sta_retry_count, MAX_RETRIES, RETRY_INTERVAL);
       } else {
-        connecting = false;
+        retryPending = false;
+        sta_status = "Disconnected";
         sta_error = "Max retries exceeded";
         LOG_ERROR("STA max retries exceeded");
+      }
+    }
+  }
+
+  if (retryPending && !connecting && WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastRetryTime >= RETRY_INTERVAL) {
+      preferences.begin("wifi", true);
+      String ssid = preferences.getString("ssid", "");
+      String pass = preferences.getString("pass", "");
+      bool hidden = preferences.getBool("hidden", false);
+      String bssid = preferences.getString("bssid", "");
+      preferences.end();
+
+      if (ssid.length() > 0) {
+        retryPending = false;
+        connectSTA(ssid, pass, hidden, bssid, false);
+      } else {
+        retryPending = false;
+        sta_status = "Disconnected";
+        sta_error = "No saved credentials";
+        LOG_ERROR("No saved credentials for retry");
       }
     }
   }
