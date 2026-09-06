@@ -1,4 +1,4 @@
-# ESP32-HID-Web-Remote-Controller
+# ESP32-HID-Web-Remote-Controller - V2
 
 **ESP32‑S3 USB HID (Mouse/Keyboard) with Wi‑Fi AP and Web Interface**  
 Control your computer or TV wirelessly from your phone or tablet – no drivers needed.
