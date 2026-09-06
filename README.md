@@ -1,6 +1,6 @@
-# ESP32-HID-Web-Remote-Controller - V4
+# ESP32-HID-Web-Remote-Controller - V5
 
-**ESP32‑S3 USB HID (Mouse/Keyboard) with Wi‑Fi AP, captive portal, persistent settings, STA (client) mode with retry, logging, and robust USB enumeration.**  
+**ESP32‑S3 Wi‑Fi to USB HID bridge with web‑based mouse/keyboard control, captive portal, STA/AP mode, auto‑channel selection, and hidden SSID.**  
 Control your computer or TV wirelessly from your phone or tablet – settings survive power cycles.
 
 [![GitHub release](https://img.shields.io/github/v/release/Aminiow/ESP32-HID-Web-Remote-Controller)](https://github.com/Aminiow/ESP32-HID-Web-Remote-Controller/releases)
@@ -15,16 +15,17 @@ Control your computer or TV wirelessly from your phone or tablet – settings su
 - ⌨ **Keyboard** – type text, send key taps (including special keys), press & hold modifiers (Ctrl, Alt, Shift, Win).
 - 🔧 **Sticky modifiers** – tap to toggle Ctrl, Alt, Shift, Win (visual feedback on web UI).
 - 💾 **Persistent settings** – sensitivity, repeat interval, and legacy mode are saved in flash (Preferences) and restored after power‑cycle.
-- 📶 **Wi‑Fi Access Point** – creates its own network (`ESP32-Mouse` / password `12345678`).
-- 🔗 **STA (Client) Mode** – can simultaneously connect to an existing Wi‑Fi network. Credentials are saved and auto‑reconnect with retries and exponential backoff.
+- 📶 **Wi‑Fi Access Point** – creates its own network with **auto‑channel selection** (scans for the least crowded channel).
+- 🔒 **Hidden SSID** – the AP name (`ESP32-Mouse`) is hidden by default for privacy (can be changed in code).
+- 🔗 **STA (Client) Mode** – can simultaneously connect to an existing Wi‑Fi network. Credentials are saved and auto‑reconnect with retries.
 - 📡 **Wi‑Fi scanning** – scan for networks and connect via the web interface (supports WPA3 and hidden networks).
 - 🔁 **Automatic retry** – if STA connection fails, it will retry up to 3 times with a configurable delay.
-- 🔗 **Captive Portal** – any DNS request resolves to the ESP32; any HTTP request shows the web UI.
+- 🔗 **Captive Portal** – any DNS request resolves to the ESP32; any HTTP request **redirects** to the web UI (HTTP 302).
 - 📱 **Responsive Web Interface** – works on phones, tablets, and desktops; touch‑friendly with a mouse pad.
 - 📊 **On‑board logging** – view logs in the web UI to help debug; raw logs available at `/logs` (JSON‑escaped).
 - 🎛 **Adjustable Settings** – sensitivity, repeat interval, and legacy mode (slower key presses for older hosts) – settings are saved automatically with debounced HTTP requests.
 - ⚡ **USB HID** – uses TinyUSB to emulate a standard USB mouse and keyboard – works out‑of‑the‑box on most OSes (Windows, macOS, Linux, Android, smart TVs).
-- 🔄 **Improved USB enumeration** – `USB.begin()` is called first with a small delay, ensuring the host detects the device reliably.
+- 🔄 **Robust USB enumeration** – `USB.begin()` is called first, ensuring the host detects the device reliably.
 - 🛡 **JSON escaping** – all API responses are properly JSON‑escaped to prevent injection.
 
 ---
@@ -72,6 +73,7 @@ cd ESP32-HID-Web-Remote-Controller
 **For Arduino IDE:**
 - Board: **ESP32S3 Dev Module**
 - USB Mode: **USB‑OTG (TinyUSB)**
+- Upload Mode: **UART0 / Hardware CDC** (or **USB‑OTG** if using the native USB port for flashing)
 - USB CDC On Boot: **Disabled** (critical for HID)
 - Upload Speed: 921600 (optional)
 
@@ -93,7 +95,7 @@ build_flags =
 - Press the **Upload** button.
 - If needed, hold the BOOT button during upload.
 
-After flashing, the ESP32 will create the Wi‑Fi network **ESP32-Mouse** (password `12345678`).
+After flashing, the ESP32 will create the Wi‑Fi network **ESP32-Mouse** (password `12345678`). The SSID is **hidden** – you will need to manually add the network on your device.
 
 ---
 
@@ -101,7 +103,7 @@ After flashing, the ESP32 will create the Wi‑Fi network **ESP32-Mouse** (passw
 
 ### Quick Start
 
-1. **Connect** your phone/tablet/laptop to the Wi‑Fi network `ESP32-Mouse`.
+1. **Manually add** the Wi‑Fi network `ESP32-Mouse` (password `12345678`) on your phone/tablet/laptop (it won't appear in scans because it's hidden).
 2. **Open any web browser** and type any domain – the captive portal will redirect to `http://192.168.4.1/`.
 3. **Plug the ESP32** into your computer/TV via USB‑C – it will be recognised as a mouse and keyboard.
 4. **Use the web UI** to control the cursor and type.
@@ -133,17 +135,50 @@ After flashing, the ESP32 will create the Wi‑Fi network **ESP32-Mouse** (passw
 
 ---
 
+## ⚙️ Configuration
+
+### Hidden SSID
+
+By default, the AP SSID is hidden. To make it visible, change this line in `setup()`:
+
+```cpp
+WiFi.softAP(ap_ssid, ap_password, bestChannel, true);  // true = hidden, false = visible
+```
+
+To change the SSID and password, modify these constants at the top of the file:
+
+```cpp
+const char* ap_ssid = "ESP32-Mouse";
+const char* ap_password = "12345678";
+```
+
+### Auto‑Channel Selection
+
+The ESP32 automatically scans nearby networks at boot and selects the least crowded channel (1-11) for its AP. This reduces interference and improves Wi‑Fi stability. The scan runs after USB enumeration, so it doesn't affect HID detection.
+
+### USB Enumeration Order
+
+V5 uses the proven order:
+```cpp
+USB.begin();
+Keyboard.begin();
+Mouse.begin();
+```
+This ensures the host detects the device reliably on the first attempt, even on older TVs and computers.
+
+---
+
 ## 🛠 Troubleshooting
 
 | Symptom | Possible cause / solution |
 |---------|---------------------------|
-| **TV/computer does not recognise USB HID** | 1. Ensure **USB CDC On Boot** is **Disabled** in board settings.<br>2. Try a different USB cable (data‑capable).<br>3. Power the ESP32 externally if the USB port can't supply enough current.<br>4. The code now uses `USB.begin(); delay(100); Mouse.begin(); Keyboard.begin();` – this order is proven to work on most hosts.<br>5. If you have a USB‑C to USB‑A cable, ensure it has the proper pull‑up resistors (some cheap cables are charge‑only). |
-| **Can’t connect to Wi‑Fi AP** | Check that the ESP32 is powered and the AP is active (look for `ESP32-Mouse` in Wi‑Fi scans). |
+| **TV/computer does not recognise USB HID** | 1. Ensure **USB CDC On Boot** is **Disabled** in board settings.<br>2. Try a different USB cable (data‑capable).<br>3. Power the ESP32 externally if the USB port can't supply enough current.<br>4. The code now uses `USB.begin(); Keyboard.begin(); Mouse.begin();` – this order is proven to work on most hosts.<br>5. If you have a USB‑C to USB‑A cable, ensure it has the proper pull‑up resistors (some cheap cables are charge‑only). |
+| **Can’t find Wi‑Fi AP** | The SSID is **hidden**. Manually add the network `ESP32-Mouse` with password `12345678`. |
 | **Captive portal not redirecting** | Manually type `http://192.168.4.1` in your browser. |
 | **Keyboard keys not sending** | Verify the USB connection and that the host has focus on a text field. |
 | **STA connection fails / retries** | Check the SSID and password. The ESP32 will retry up to 3 times. If it still fails, check the logs at `/logs` for details. |
 | **Settings not saved** | Ensure the Preferences namespace has enough space (default should be fine). Settings are saved to flash – they persist across power‑cycles. |
-| **Wi‑Fi scan doesn't show networks** | Make sure you are in range and that the ESP32’s antenna is connected. On the STA settings page, click “Retry” if the scan times out. |
+| **Wi‑Fi scan doesn't show networks** | Make sure you are in range and that the ESP32’s antenna is connected. On the STA settings page, click “Refresh” if the scan times out. |
 
 ---
 
