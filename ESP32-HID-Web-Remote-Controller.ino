@@ -1,4 +1,4 @@
-// V2
+// V3
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -6,6 +6,9 @@
 #include <USB.h>
 #include <USBHIDMouse.h>
 #include <USBHIDKeyboard.h>
+#include <Preferences.h>
+#include <cstdarg>
+#include <cstdio>
 
 USBHIDMouse Mouse;
 USBHIDKeyboard Keyboard;
@@ -13,9 +16,12 @@ WebServer server(80);
 DNSServer dnsServer;
 WebSocketsServer webSocket(81);
 
-const char* ssid = "ESP32-Mouse";
-const char* password = "12345678";
+Preferences preferences;
 
+const char* ap_ssid = "ESP32-Mouse";
+const char* ap_password = "12345678";
+
+// Persistent settings
 float sensitivity = 2.0;
 int repeatInterval = 100;
 bool legacyMode = false;
@@ -25,6 +31,61 @@ bool altPressed = false;
 bool shiftPressed = false;
 bool winPressed = false;
 
+// STA status
+String sta_ssid = "";
+String sta_ip = "";
+String sta_status = "Disconnected";
+String sta_error = "";
+bool scanInProgress = false;
+int sta_retry_count = 0;
+const int MAX_RETRIES = 3;
+const unsigned long CONNECT_TIMEOUT = 10000;  // 10 seconds
+unsigned long connectStartTime = 0;
+bool connecting = false;
+
+unsigned long lastRetryTime = 0;
+const unsigned long RETRY_INTERVAL = 5000;  // 5 seconds between retries
+
+// ---------- Logging System ----------
+#define MAX_LOG_ENTRIES 200
+
+struct LogEntry {
+  unsigned long timestamp;
+  char level[8];
+  char message[256];
+};
+
+LogEntry logBuffer[MAX_LOG_ENTRIES];
+int logHead = 0;
+int logCount = 0;
+
+void addLog(const char* level, const char* format, ...) {
+  char msg[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(msg, sizeof(msg), format, args);
+  va_end(args);
+
+  LogEntry* entry = &logBuffer[logHead];
+  entry->timestamp = millis();
+  strncpy(entry->level, level, sizeof(entry->level) - 1);
+  entry->level[sizeof(entry->level) - 1] = '\0';
+  strncpy(entry->message, msg, sizeof(entry->message) - 1);
+  entry->message[sizeof(entry->message) - 1] = '\0';
+
+  logHead = (logHead + 1) % MAX_LOG_ENTRIES;
+  if (logCount < MAX_LOG_ENTRIES) logCount++;
+
+  // Also print to serial
+  Serial.printf("[%lu] [%s] %s\n", millis(), level, msg);
+}
+
+#define LOG_INFO(...) addLog("INFO", __VA_ARGS__)
+#define LOG_WARN(...) addLog("WARN", __VA_ARGS__)
+#define LOG_ERROR(...) addLog("ERROR", __VA_ARGS__)
+#define LOG_SUCCESS(...) addLog("SUCCESS", __VA_ARGS__)
+
+// ---------- Helper functions ----------
 int16_t clamp(int16_t v, int16_t minv, int16_t maxv) {
   if (v < minv) return minv;
   if (v > maxv) return maxv;
@@ -48,6 +109,7 @@ void releaseAllModifiers() {
   Keyboard.release(KEY_LEFT_ALT);
   Keyboard.release(KEY_LEFT_SHIFT);
   Keyboard.release(KEY_LEFT_GUI);
+  LOG_INFO("All modifiers released");
 }
 
 void toggleModifier(const String& mod) {
@@ -56,8 +118,166 @@ void toggleModifier(const String& mod) {
   else if (mod == "SHIFT") shiftPressed = !shiftPressed;
   else if (mod == "WIN") winPressed = !winPressed;
   applyModifiers();
+  LOG_INFO("Toggled modifier %s -> %d", mod.c_str(), (mod == "CTRL" ? ctrlPressed : (mod == "ALT" ? altPressed : (mod == "SHIFT" ? shiftPressed : winPressed))));
 }
 
+// ---------- Persistent settings ----------
+void loadSettings() {
+  preferences.begin("settings", true);
+  sensitivity = preferences.getFloat("sens", 2.0);
+  repeatInterval = preferences.getInt("repeat", 100);
+  legacyMode = preferences.getBool("legacy", false);
+  preferences.end();
+  LOG_INFO("Settings loaded: sens=%.1f, repeat=%d, legacy=%d", sensitivity, repeatInterval, legacyMode);
+}
+
+void saveSettings() {
+  preferences.begin("settings", false);
+  preferences.putFloat("sens", sensitivity);
+  preferences.putInt("repeat", repeatInterval);
+  preferences.putBool("legacy", legacyMode);
+  preferences.end();
+  LOG_INFO("Settings saved");
+}
+
+// ---------- WiFi STA management ----------
+void updateSTAStatus() {
+  if (WiFi.status() == WL_CONNECTED) {
+    sta_status = "Connected";
+    sta_ip = WiFi.localIP().toString();
+    sta_ssid = WiFi.SSID();
+    sta_error = "";
+    connecting = false;
+    sta_retry_count = 0;
+    LOG_SUCCESS("STA connected to %s, IP %s", sta_ssid.c_str(), sta_ip.c_str());
+  } else {
+    sta_status = "Disconnected";
+    sta_ip = "";
+    sta_ssid = "";
+    wl_status_t status = WiFi.status();
+    switch (status) {
+      case WL_NO_SSID_AVAIL: sta_error = "SSID not found"; break;
+      case WL_CONNECT_FAILED: sta_error = "Connection failed"; break;
+#ifdef WL_WRONG_PASSWORD
+      case WL_WRONG_PASSWORD: sta_error = "Wrong password"; break;
+#endif
+      case WL_IDLE_STATUS: sta_error = "Idle"; break;
+      case WL_DISCONNECTED: sta_error = "Disconnected"; break;
+#ifdef WL_CONNECTION_LOST
+      case WL_CONNECTION_LOST: sta_error = "Connection lost"; break;
+#endif
+      default: sta_error = "Unknown error"; break;
+    }
+    if (connecting && (millis() - connectStartTime > CONNECT_TIMEOUT)) {
+      sta_error = "Connection timeout";
+      connecting = false;
+    }
+    LOG_WARN("STA status: %s, error: %s", sta_status.c_str(), sta_error.c_str());
+  }
+}
+
+void WiFiEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      sta_status = "Connecting...";
+      LOG_INFO("STA connected to AP");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      updateSTAStatus();
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      updateSTAStatus();
+      LOG_WARN("STA disconnected");
+      break;
+    default: break;
+  }
+}
+
+void connectSTA(String ssid, String password, bool hidden, String bssid_str) {
+  if (ssid.length() == 0) {
+    LOG_ERROR("connectSTA called with empty SSID");
+    return;
+  }
+
+  // Prevent re-entrancy: if we're already connected or connecting, abort
+  if (connecting || WiFi.status() == WL_CONNECTED) {
+    LOG_WARN("connectSTA aborted: already connecting or connected");
+    return;
+  }
+
+  // Force a clean stop of any ongoing connection
+  WiFi.disconnect(true);
+  delay(100);
+
+  // Save credentials
+  preferences.begin("wifi", false);
+  preferences.putString("ssid", ssid);
+  preferences.putString("pass", password);
+  preferences.putBool("hidden", hidden);
+  if (hidden) {
+    preferences.putString("bssid", bssid_str);
+  } else {
+    preferences.putString("bssid", "");
+  }
+  preferences.end();
+
+  WiFi.mode(WIFI_AP_STA);
+  connecting = true;
+  connectStartTime = millis();
+  sta_retry_count = 0;
+  sta_error = "Connecting...";
+
+  LOG_INFO("Connecting to STA: %s (hidden=%d, bssid=%s)", ssid.c_str(), hidden, bssid_str.c_str());
+
+  if (hidden && bssid_str.length() > 0) {
+    uint8_t bssid[6];
+    int count = sscanf(bssid_str.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                       &bssid[0], &bssid[1], &bssid[2],
+                       &bssid[3], &bssid[4], &bssid[5]);
+    if (count == 6) {
+      WiFi.begin(ssid.c_str(), password.c_str(), 0, bssid);
+    } else {
+      LOG_ERROR("Invalid BSSID format: %s", bssid_str.c_str());
+      WiFi.begin(ssid.c_str(), password.c_str());
+    }
+  } else {
+    WiFi.begin(ssid.c_str(), password.c_str());
+  }
+}
+
+void loadSTAConfig() {
+  preferences.begin("wifi", true);
+  String ssid = preferences.getString("ssid", "");
+  String pass = preferences.getString("pass", "");
+  bool hidden = preferences.getBool("hidden", false);
+  String bssid = preferences.getString("bssid", "");
+  preferences.end();
+  if (ssid.length() > 0) {
+    LOG_INFO("Loading saved STA config: %s", ssid.c_str());
+    connectSTA(ssid, pass, hidden, bssid);
+  } else {
+    LOG_INFO("No saved STA config found");
+  }
+}
+
+void disconnectSTA() {
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP);
+  connecting = false;
+  sta_retry_count = 0;
+  updateSTAStatus();
+  LOG_INFO("STA disconnected manually");
+}
+
+void forgetSTA() {
+  preferences.begin("wifi", false);
+  preferences.clear();
+  preferences.end();
+  disconnectSTA();
+  LOG_INFO("STA credentials forgotten");
+}
+
+// ---------- WebSocket event ----------
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   if (type == WStype_TEXT) {
     String msg = "";
@@ -68,24 +288,40 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
       dx = clamp(dx, -127, 127);
       dy = clamp(dy, -127, 127);
       Mouse.move(dx, dy, 0);
+      LOG_INFO("WebSocket move dx=%d dy=%d", dx, dy);
+    } else {
+      LOG_WARN("WebSocket received unknown message: %s", msg.c_str());
     }
+  } else if (type == WStype_CONNECTED) {
+    LOG_INFO("WebSocket client connected, id=%u", num);
+  } else if (type == WStype_DISCONNECTED) {
+    LOG_INFO("WebSocket client disconnected, id=%u", num);
   }
 }
 
+// ---------- HTTP endpoints (HID) ----------
 void handleMove() {
   int dx = server.arg("dx").toInt();
   int dy = server.arg("dy").toInt();
   dx = clamp(dx, -127, 127);
   dy = clamp(dy, -127, 127);
   Mouse.move(dx, dy, 0);
+  LOG_INFO("Mouse move dx=%d dy=%d", dx, dy);
   server.send(200, "text/plain", "OK");
 }
 
 void handleClick() {
   String btn = server.arg("btn");
-  if (btn == "right") Mouse.click(MOUSE_RIGHT);
-  else if (btn == "middle") Mouse.click(MOUSE_MIDDLE);
-  else Mouse.click(MOUSE_LEFT);
+  if (btn == "right") {
+    Mouse.click(MOUSE_RIGHT);
+    LOG_INFO("Mouse click right");
+  } else if (btn == "middle") {
+    Mouse.click(MOUSE_MIDDLE);
+    LOG_INFO("Mouse click middle");
+  } else {
+    Mouse.click(MOUSE_LEFT);
+    LOG_INFO("Mouse click left");
+  }
   server.send(200, "text/plain", "OK");
 }
 
@@ -95,27 +331,43 @@ void handleDoubleClick() {
     Mouse.click(MOUSE_RIGHT);
     delay(50);
     Mouse.click(MOUSE_RIGHT);
+    LOG_INFO("Mouse double click right");
   } else {
     Mouse.click(MOUSE_LEFT);
     delay(50);
     Mouse.click(MOUSE_LEFT);
+    LOG_INFO("Mouse double click left");
   }
   server.send(200, "text/plain", "OK");
 }
 
 void handleDown() {
   String btn = server.arg("btn");
-  if (btn == "right") Mouse.press(MOUSE_RIGHT);
-  else if (btn == "middle") Mouse.press(MOUSE_MIDDLE);
-  else Mouse.press(MOUSE_LEFT);
+  if (btn == "right") {
+    Mouse.press(MOUSE_RIGHT);
+    LOG_INFO("Mouse press right");
+  } else if (btn == "middle") {
+    Mouse.press(MOUSE_MIDDLE);
+    LOG_INFO("Mouse press middle");
+  } else {
+    Mouse.press(MOUSE_LEFT);
+    LOG_INFO("Mouse press left");
+  }
   server.send(200, "text/plain", "OK");
 }
 
 void handleUp() {
   String btn = server.arg("btn");
-  if (btn == "right") Mouse.release(MOUSE_RIGHT);
-  else if (btn == "middle") Mouse.release(MOUSE_MIDDLE);
-  else Mouse.release(MOUSE_LEFT);
+  if (btn == "right") {
+    Mouse.release(MOUSE_RIGHT);
+    LOG_INFO("Mouse release right");
+  } else if (btn == "middle") {
+    Mouse.release(MOUSE_MIDDLE);
+    LOG_INFO("Mouse release middle");
+  } else {
+    Mouse.release(MOUSE_LEFT);
+    LOG_INFO("Mouse release left");
+  }
   server.send(200, "text/plain", "OK");
 }
 
@@ -123,6 +375,7 @@ void handleWheel() {
   int delta = server.arg("delta").toInt();
   delta = clamp(delta, -127, 127);
   Mouse.move(0, 0, delta);
+  LOG_INFO("Mouse wheel delta=%d", delta);
   server.send(200, "text/plain", "OK");
 }
 
@@ -131,6 +384,8 @@ void handleSetSensitivity() {
   if (val < 0.1) val = 0.1;
   if (val > 10.0) val = 10.0;
   sensitivity = val;
+  saveSettings();
+  LOG_INFO("Sensitivity set to %.1f", sensitivity);
   server.send(200, "text/plain", "OK");
 }
 
@@ -139,12 +394,16 @@ void handleSetRepeatInterval() {
   if (val < 20) val = 20;
   if (val > 1000) val = 1000;
   repeatInterval = val;
+  saveSettings();
+  LOG_INFO("Repeat interval set to %d ms", repeatInterval);
   server.send(200, "text/plain", "OK");
 }
 
 void handleSetLegacyMode() {
   int val = server.arg("value").toInt();
   legacyMode = (val == 1);
+  saveSettings();
+  LOG_INFO("Legacy mode set to %d", legacyMode);
   server.send(200, "text/plain", "OK");
 }
 
@@ -158,6 +417,7 @@ void sendKeyTap(uint8_t keycode) {
     delay(20);
     Keyboard.release(keycode);
   }
+  LOG_INFO("Key tap: 0x%02X", keycode);
 }
 
 void handleType() {
@@ -167,6 +427,7 @@ void handleType() {
     char c = text.charAt(i);
     if (c >= 32 && c <= 126) asciiText += c;
   }
+  LOG_INFO("Typing text: %s", asciiText.c_str());
   for (size_t i = 0; i < asciiText.length(); i++) {
     char c = asciiText.charAt(i);
     if (legacyMode) {
@@ -234,21 +495,36 @@ uint8_t keyNameToCode(const String& key) {
 void handleKeyTap() {
   String key = server.arg("key");
   uint8_t code = keyNameToCode(key);
-  if (code != 0) sendKeyTap(code);
+  if (code != 0) {
+    sendKeyTap(code);
+    LOG_INFO("Key tap: %s (0x%02X)", key.c_str(), code);
+  } else {
+    LOG_WARN("Unknown key: %s", key.c_str());
+  }
   server.send(200, "text/plain", "OK");
 }
 
 void handleKeyDown() {
   String key = server.arg("key");
   uint8_t code = keyNameToCode(key);
-  if (code != 0) Keyboard.press(code);
+  if (code != 0) {
+    Keyboard.press(code);
+    LOG_INFO("Key down: %s (0x%02X)", key.c_str(), code);
+  } else {
+    LOG_WARN("Unknown key down: %s", key.c_str());
+  }
   server.send(200, "text/plain", "OK");
 }
 
 void handleKeyUp() {
   String key = server.arg("key");
   uint8_t code = keyNameToCode(key);
-  if (code != 0) Keyboard.release(code);
+  if (code != 0) {
+    Keyboard.release(code);
+    LOG_INFO("Key up: %s (0x%02X)", key.c_str(), code);
+  } else {
+    LOG_WARN("Unknown key up: %s", key.c_str());
+  }
   server.send(200, "text/plain", "OK");
 }
 
@@ -263,6 +539,181 @@ void handleResetModifiers() {
   server.send(200, "text/plain", "OK");
 }
 
+// ---------- STA endpoints ----------
+void handleSTAStatus() {
+  String json = "{";
+  json += "\"connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
+  json += ",\"ssid\":\"" + sta_ssid + "\"";
+  json += ",\"ip\":\"" + sta_ip + "\"";
+  json += ",\"status\":\"" + sta_status + "\"";
+  json += ",\"error\":\"" + sta_error + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSTAScan() {
+  int n = WiFi.scanComplete();
+
+  // --------------------------------------------------
+  // Scan is currently running
+  // --------------------------------------------------
+  if (n == WIFI_SCAN_RUNNING) {
+    scanInProgress = true;
+    server.send(200, "application/json", "{\"scanning\":true}");
+    return;
+  }
+
+  // --------------------------------------------------
+  // Scan failed / no scan exists -> start async scan
+  // --------------------------------------------------
+  if (n == WIFI_SCAN_FAILED) {
+    if (!scanInProgress) {
+      scanInProgress = true;
+
+      LOG_INFO("Starting WiFi scan...");
+
+      // Do NOT disconnect WiFi here.
+      // AP+STA can scan while the AP remains active.
+      WiFi.scanNetworks(true);
+
+      server.send(200, "application/json", "{\"scanning\":true}");
+      return;
+    }
+
+    scanInProgress = false;
+    LOG_ERROR("WiFi scan failed");
+
+    server.send(200, "application/json",
+                "{\"error\":\"WiFi scan failed\"}");
+    return;
+  }
+
+  // --------------------------------------------------
+  // Scan completed
+  // n >= 0
+  // --------------------------------------------------
+  if (n >= 0) {
+    String json = "[";
+
+    for (int i = 0; i < n; i++) {
+      if (i > 0) json += ",";
+
+      String ssid = WiFi.SSID(i);
+      String bssid = WiFi.BSSIDstr(i);
+      int rssi = WiFi.RSSI(i);
+      wifi_auth_mode_t encryption = WiFi.encryptionType(i);
+
+      String encType;
+
+      switch (encryption) {
+        case WIFI_AUTH_OPEN:
+          encType = "Open";
+          break;
+
+        case WIFI_AUTH_WEP:
+          encType = "WEP";
+          break;
+
+        case WIFI_AUTH_WPA_PSK:
+          encType = "WPA";
+          break;
+
+        case WIFI_AUTH_WPA2_PSK:
+          encType = "WPA2";
+          break;
+
+        case WIFI_AUTH_WPA_WPA2_PSK:
+          encType = "WPA/WPA2";
+          break;
+
+        case WIFI_AUTH_WPA2_ENTERPRISE:
+          encType = "WPA2-Enterprise";
+          break;
+
+        default:
+          encType = "Unknown";
+          break;
+      }
+
+      json += "{";
+      json += "\"ssid\":\"" + ssid + "\",";
+      json += "\"rssi\":" + String(rssi) + ",";
+      json += "\"encryption\":" + String((int)encryption) + ",";
+      json += "\"bssid\":\"" + bssid + "\",";
+      json += "\"encryption_str\":\"" + encType + "\"";
+      json += "}";
+    }
+
+    json += "]";
+
+    LOG_INFO("WiFi scan completed, %d networks found", n);
+
+    scanInProgress = false;
+
+    WiFi.scanDelete();
+
+    server.send(200, "application/json", json);
+    return;
+  }
+
+  // --------------------------------------------------
+  // Unexpected state
+  // --------------------------------------------------
+  scanInProgress = false;
+
+  LOG_ERROR("Unexpected WiFi scan state: %d", n);
+
+  server.send(500, "application/json",
+              "{\"error\":\"Unexpected scan state\"}");
+}
+
+void handleSTAConnect() {
+  String ssid = server.arg("ssid");
+  String password = server.arg("pass");
+  String hiddenStr = server.arg("hidden");
+  String bssid = server.arg("bssid");
+  bool hidden = (hiddenStr == "1" || hiddenStr == "true");
+
+  if (ssid.length() == 0) {
+    LOG_ERROR("STA connect called with empty SSID");
+    server.send(400, "text/plain", "SSID required");
+    return;
+  }
+  LOG_INFO("STA connect request: ssid=%s, hidden=%d, bssid=%s", ssid.c_str(), hidden, bssid.c_str());
+  connectSTA(ssid, password, hidden, bssid);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSTADisconnect() {
+  LOG_INFO("STA disconnect request");
+  disconnectSTA();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSTAForget() {
+  LOG_INFO("STA forget request");
+  forgetSTA();
+  server.send(200, "text/plain", "OK");
+}
+
+// ---------- Logs endpoint ----------
+void handleLogs() {
+  String json = "[";
+  int start = (logHead - logCount + MAX_LOG_ENTRIES) % MAX_LOG_ENTRIES;
+  for (int i = 0; i < logCount; i++) {
+    int idx = (start + i) % MAX_LOG_ENTRIES;
+    if (i) json += ",";
+    json += "{";
+    json += "\"timestamp\":" + String(logBuffer[idx].timestamp);
+    json += ",\"level\":\"" + String(logBuffer[idx].level) + "\"";
+    json += ",\"message\":\"" + String(logBuffer[idx].message) + "\"";
+    json += "}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+// ---------- Web pages ----------
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -272,160 +723,48 @@ const char index_html[] PROGMEM = R"rawliteral(
 <title>ESP32 HID Controller</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: 'Segoe UI', Roboto, sans-serif;
-    background: #0b0b0b;
-    color: #eee;
-    padding: 12px;
-    min-height: 100vh;
-  }
-  .container {
-    max-width: 1200px;
-    margin: 0 auto;
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 16px;
-  }
-  @media (min-width: 780px) {
-    .container { grid-template-columns: 1fr 1fr; }
-    .full-width { grid-column: 1 / -1; }
-  }
-  .card {
-    background: #1e1e1e;
-    border-radius: 16px;
-    padding: 18px;
-    border: 1px solid #333;
-    box-shadow: 0 8px 20px rgba(0,0,0,0.5);
-  }
-  h2 {
-    font-size: 1.6rem;
-    color: #5b9aff;
-    text-align: center;
-    margin-bottom: 10px;
-    font-weight: 300;
-    letter-spacing: 1px;
-  }
-  h3 {
-    font-size: 1.2rem;
-    color: #aaa;
-    text-align: center;
-    margin-bottom: 14px;
-    font-weight: 400;
-  }
-  .slider-group {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: center;
-    gap: 10px 20px;
-    margin: 8px 0;
-  }
-  .slider-group label {
-    font-size: 14px;
-    color: #ccc;
-  }
-  input[type=range] {
-    flex: 1;
-    min-width: 120px;
-    height: 4px;
-    -webkit-appearance: none;
-    appearance: none;
-    background: #444;
-    border-radius: 2px;
-    outline: none;
-  }
-  input[type=range]::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background: #5b9aff;
-    cursor: pointer;
-  }
-  .slider-value {
-    min-width: 40px;
-    text-align: center;
-    color: #5b9aff;
-    font-weight: 600;
-  }
-  .btn-group {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    justify-content: center;
-    margin: 8px 0;
-  }
-  button {
-    padding: 8px 16px;
-    background: #2a2a2a;
-    color: #eee;
-    border: 1px solid #444;
-    border-radius: 8px;
-    cursor: pointer;
-    font-size: 14px;
-    transition: 0.15s;
-    font-weight: 500;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.3);
-  }
-  button:hover {
-    background: #3a3a3a;
-    transform: translateY(-1px);
-  }
-  button:active {
-    transform: translateY(0);
-    background: #444;
-  }
-  button.accent {
-    background: #2c5f8a;
-    border-color: #3a7bbd;
-  }
+  body { font-family: 'Segoe UI', Roboto, sans-serif; background: #0b0b0b; color: #eee; padding: 12px; min-height: 100vh; }
+  .container { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 780px) { .container { grid-template-columns: 1fr 1fr; } .full-width { grid-column: 1 / -1; } }
+  .card { background: #1e1e1e; border-radius: 16px; padding: 18px; border: 1px solid #333; box-shadow: 0 8px 20px rgba(0,0,0,0.5); }
+  h2 { font-size: 1.6rem; color: #5b9aff; text-align: center; margin-bottom: 10px; font-weight: 300; letter-spacing: 1px; }
+  h3 { font-size: 1.2rem; color: #aaa; text-align: center; margin-bottom: 14px; font-weight: 400; }
+  .slider-group { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 10px 20px; margin: 8px 0; }
+  .slider-group label { font-size: 14px; color: #ccc; }
+  input[type=range] { flex: 1; min-width: 120px; height: 4px; -webkit-appearance: none; appearance: none; background: #444; border-radius: 2px; outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #5b9aff; cursor: pointer; }
+  .slider-value { min-width: 40px; text-align: center; color: #5b9aff; font-weight: 600; }
+  .btn-group { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 8px 0; }
+  button { padding: 8px 16px; background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 8px; cursor: pointer; font-size: 14px; transition: 0.15s; font-weight: 500; box-shadow: 0 2px 4px rgba(0,0,0,0.3); }
+  button:hover { background: #3a3a3a; transform: translateY(-1px); }
+  button:active { transform: translateY(0); background: #444; }
+  button.accent { background: #2c5f8a; border-color: #3a7bbd; }
   button.accent:hover { background: #3a7bbd; }
-  button.mod-active {
-    background: #f39c12;
-    color: #000;
-    border-color: #f1c40f;
-  }
-  button.pressed {
-    background: #f39c12;
-    color: #000;
-    border-color: #f1c40f;
-  }
-  #pad {
-    width: 100%;
-    height: 200px;
-    background: #181818;
-    border-radius: 12px;
-    border: 2px solid #333;
-    touch-action: none;
-    cursor: crosshair;
-    margin: 10px 0;
-    transition: border 0.2s;
-  }
+  button.mod-active { background: #f39c12; color: #000; border-color: #f1c40f; }
+  button.pressed { background: #f39c12; color: #000; border-color: #f1c40f; }
+  #pad { width: 100%; height: 200px; background: #181818; border-radius: 12px; border: 2px solid #333; touch-action: none; cursor: crosshair; margin: 10px 0; transition: border 0.2s; }
   #pad:active { border-color: #5b9aff; }
-  .arrow-row {
-    display: flex;
-    justify-content: center;
-    gap: 6px;
-    margin: 4px 0;
-  }
-  .arrow-row button {
-    min-width: 48px;
-    height: 44px;
-    font-size: 18px;
-  }
+  .arrow-row { display: flex; justify-content: center; gap: 6px; margin: 4px 0; }
+  .arrow-row button { min-width: 48px; height: 44px; font-size: 18px; }
 
-  /* -------- Keyboard -------- */
   .kb-grid {
-    display: grid;
-    grid-template-columns: repeat(15, 1fr);
-    gap: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    width: 100%;
+    max-width: 900px;
     margin: 12px auto 0;
-    max-width: 100%;
-    width: fit-content;
-    justify-content: center;
+    overflow-x: auto;
+  }
+  .kb-row {
+    display: flex;
+    gap: 5px;
+    width: max-content;
+    min-width: 100%;
   }
   .kb-key {
+    flex: 0 0 44px;
+    height: 42px;
     background: #2a2a2a;
     border: 1px solid #444;
     border-radius: 6px;
@@ -434,80 +773,58 @@ const char index_html[] PROGMEM = R"rawliteral(
     align-items: center;
     justify-content: center;
     font-size: 13px;
-    padding: 4px 0;
     cursor: pointer;
-    transition: 0.1s;
     user-select: none;
-    min-height: 36px;
-    min-width: 36px;
+    transition: 0.1s;
   }
-  .kb-key:hover { background: #3a3a3a; }
-  .kb-key:active { background: #444; }
-  .kb-key.special { background: #2c3e50; }
+  .kb-key:hover {
+    background: #3a3a3a;
+  }
+  .kb-key:active {
+    background: #444;
+  }
+  .kb-key.special {
+    background: #2c3e50;
+  }
   .kb-key.special:hover { background: #3e5a6f; }
-  .kb-key.wide { grid-column: span 2; }
-  .kb-key.space { grid-column: span 6; }
-  .kb-key.mod-down { background: #5b9aff; color: #000; }
-  .kb-key.last-clicked { background: #5b9aff; color: #000; border-color: #7ab7ff; }
-  .kb-key.empty { visibility: hidden; pointer-events: none; }
+  .kb-key.mod-down {
+    background: #5b9aff;
+    color: #000;
+  }
+  .kb-key.last-clicked {
+    background: #5b9aff;
+    color: #000;
+    border-color: #7ab7ff;
+  }
 
-  /* numpad */
   .numpad {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 4px;
-    max-width: 180px;
-    margin: 10px auto 0;
+    grid-template-columns: repeat(4, 48px);
+    grid-template-rows: repeat(5, 42px);
+    gap: 5px;
+    width: max-content;
+    margin: 12px auto 0;
   }
-  .numpad .kb-key { min-height: 34px; }
-  .numpad .tall { grid-row: span 2; }
-  .numpad .zero { grid-column: span 2; }
+  .numpad .kb-key {
+    width: 48px;
+    height: 42px;
+    min-height: 42px;
+    flex: none;
+  }
+  .numpad .tall {
+    grid-row: span 2;
+  }
+  .numpad .zero {
+    grid-column: span 2;
+  }
 
-  .row-label {
-    font-size: 12px;
-    color: #666;
-    text-align: center;
-    margin: 6px 0 2px;
-  }
-  .text-input-area {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    justify-content: center;
-    margin: 10px 0;
-  }
-  input[type=text] {
-    background: #222;
-    border: 1px solid #444;
-    border-radius: 8px;
-    padding: 8px 14px;
-    color: #eee;
-    font-size: 16px;
-    flex: 1;
-    min-width: 160px;
-    max-width: 380px;
-    outline: none;
-  }
+  .row-label { font-size: 12px; color: #666; text-align: center; margin: 6px 0 2px; }
+  .text-input-area { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin: 10px 0; }
+  input[type=text] { background: #222; border: 1px solid #444; border-radius: 8px; padding: 8px 14px; color: #eee; font-size: 16px; flex: 1; min-width: 160px; max-width: 380px; outline: none; }
   input[type=text]:focus { border-color: #5b9aff; }
-  .small {
-    font-size: 12px;
-    color: #777;
-    text-align: center;
-    margin-top: 6px;
-  }
+  .small { font-size: 12px; color: #777; text-align: center; margin-top: 6px; }
 
-  .log-panel {
-    background: #121212;
-    border: 1px solid #333;
-    border-radius: 8px;
-    padding: 10px;
-    max-height: 180px;
-    overflow-y: auto;
-    margin-top: 10px;
-    display: none;
-    font-family: monospace;
-    font-size: 12px;
-  }
+  .log-panel { background: #121212; border: 1px solid #333; border-radius: 8px; padding: 10px; max-height: 180px; overflow-y: auto; margin-top: 10px; display: none; font-family: monospace; font-size: 12px; }
   .log-panel.visible { display: block; }
   .log-entry { padding: 2px 0; border-bottom: 1px solid #1a1a1a; }
   .log-info { color: #aaa; }
@@ -515,16 +832,56 @@ const char index_html[] PROGMEM = R"rawliteral(
   .log-error { color: #e74c3c; }
   .log-success { color: #2ecc71; }
 
+  .sta-status { background: #1a1a1a; border-radius: 8px; padding: 8px 16px; margin-bottom: 10px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; border-left: 4px solid #555; }
+  .sta-status .label { font-weight: 500; color: #aaa; }
+  .sta-status .status-text { color: #eee; }
+  .sta-status .connected { color: #2ecc71; }
+  .sta-status .disconnected { color: #e74c3c; }
+  .sta-status .ip { color: #5b9aff; }
+
+  /* Different real keyboard key sizes */
+  .kb-key.w75  { flex-basis: 75px; }
+  .kb-key.w85  { flex-basis: 85px; }
+  .kb-key.w95  { flex-basis: 95px; }
+  .kb-key.w110 { flex-basis: 110px; }
+  .kb-key.w125 { flex-basis: 125px; }
+  .kb-key.space { flex-basis: 220px; }
+
   @media (max-width: 600px) {
-    .kb-grid { font-size: 11px; gap: 3px; }
-    .kb-key { min-height: 30px; padding: 2px 0; min-width: 28px; }
+    .kb-grid {
+      width: 100%;
+      overflow-x: hidden;
+    }
+
+    .kb-key {
+      flex-basis: 34px;
+      height: 38px;
+      font-size: 10px;
+    }
+
+    .kb-key.w75  { flex-basis: 48px; }
+    .kb-key.w95  { flex-basis: 60px; }
+    .kb-key.w110 { flex-basis: 70px; }
+    .kb-key.w125 { flex-basis: 82px; }
+    .kb-key.space { flex-basis: 150px; }
   }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="card full-width">
-    <h2>⚡ ESP32 HID Controller</h2>
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h2 style="margin:0;">⚡ ESP32 HID Controller</h2>
+      <a href="/sta" style="color:#5b9aff; font-size:20px; text-decoration:none;">📶</a>
+    </div>
+    <div class="sta-status" id="staStatus">
+      <span class="label">Wi‑Fi:</span>
+      <span class="status-text" id="staStatusText">Loading...</span>
+      <span style="margin-left:auto;">
+        <button onclick="window.location.href='/sta'" style="background:#333; padding:4px 12px; font-size:12px;">Settings</button>
+      </span>
+    </div>
+
     <div class="slider-group">
       <label>Sensitivity</label>
       <input type="range" id="sens" min="0.5" max="5" step="0.1" value="2.0">
@@ -539,6 +896,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       <button onclick="testAll()">🧪 Test All</button>
       <button onclick="toggleLogs()">📋 Logs</button>
       <button onclick="clearLogs()">🗑 Clear</button>
+      <button onclick="window.location.href='/logs'" style="background:#333;">📄 Raw Logs</button>
     </div>
     <div id="logPanel" class="log-panel"></div>
   </div>
@@ -685,6 +1043,24 @@ document.getElementById('legacyCheck').addEventListener('change', function() {
   logInfo('Legacy mode = ' + legacyMode);
 });
 
+// ========== STA STATUS UPDATE ==========
+function updateSTAStatus() {
+  fetch('/sta/status')
+    .then(res => res.json())
+    .then(data => {
+      const statusText = document.getElementById('staStatusText');
+      if (data.connected) {
+        statusText.innerHTML = `<span class="connected">Connected</span> to <strong>${data.ssid}</strong> (IP: <span class="ip">${data.ip}</span>)`;
+      } else {
+        let err = data.error || 'Not connected';
+        statusText.innerHTML = `<span class="disconnected">Disconnected</span> – ${err}`;
+      }
+    })
+    .catch(() => {});
+}
+setInterval(updateSTAStatus, 3000);
+updateSTAStatus();
+
 // ========== MOUSE PAD ==========
 const pad = document.getElementById('pad');
 let padDown = false, startX, startY, lastX, lastY, moved, startTime;
@@ -727,7 +1103,7 @@ document.querySelectorAll('.arrow-row button[data-dx]').forEach(btn => {
   btn.addEventListener('pointerleave', () => { clearInterval(repeatTimer); repeatTimer = null; });
 });
 
-// ========== MOUSE HOLD STATE (visual toggles) ==========
+// ========== MOUSE HOLD STATE ==========
 const mouseState = { left: false, right: false };
 
 function updateMouseUI() {
@@ -747,7 +1123,7 @@ function mouseUp(btn) {
   updateMouseUI();
 }
 
-// ========== MODIFIERS (sticky toggles) ==========
+// ========== MODIFIERS ==========
 const modState = { CTRL: false, ALT: false, SHIFT: false, WIN: false };
 document.querySelectorAll('#modButtons button').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -796,111 +1172,257 @@ function highlightKey(el) {
 function buildKeyboard() {
   const grid = document.getElementById('keyboard');
   grid.innerHTML = '';
-  rows.forEach(row => {
-    row.forEach(label => {
+
+  const keyboardRows = [
+    [
+      ['Esc','w75'],
+      ['F1',''], ['F2',''], ['F3',''], ['F4',''],
+      ['F5',''], ['F6',''], ['F7',''], ['F8',''],
+      ['F9',''], ['F10',''], ['F11',''], ['F12',''],
+      ['PrtSc','w75'], ['ScrLk','w75'], ['Pause','w75']
+    ],
+
+    [
+      ['`',''], ['1',''], ['2',''], ['3',''], ['4',''],
+      ['5',''], ['6',''], ['7',''], ['8',''], ['9',''],
+      ['0',''], ['-',''], ['=',''], ['Backspace','w110']
+    ],
+
+    [
+      ['Tab','w75'],
+      ['q',''], ['w',''], ['e',''], ['r',''], ['t',''],
+      ['y',''], ['u',''], ['i',''], ['o',''], ['p',''],
+      ['[',''], [']',''], ['\\','w75']
+    ],
+
+    [
+      ['CapsLock','w95'],
+      ['a',''], ['s',''], ['d',''], ['f',''], ['g',''],
+      ['h',''], ['j',''], ['k',''], ['l',''], [';',''],
+      ["'",''],
+      ['Enter','w95']
+    ],
+
+    [
+      ['Shift','w125'],
+      ['z',''], ['x',''], ['c',''], ['v',''], ['b',''],
+      ['n',''], ['m',''], [',',''], ['.',''], ['/',''],
+      ['Shift','w125']
+    ],
+
+    [
+      ['Ctrl','w75'],
+      ['Win','w75'],
+      ['Alt','w75'],
+      ['Space','space'],
+      ['Alt','w75'],
+      ['Win','w75'],
+      ['Menu','w75'],
+      ['Ctrl','w75']
+    ]
+  ];
+
+  keyboardRows.forEach(row => {
+    const rowEl = document.createElement('div');
+    rowEl.className = 'kb-row';
+
+    row.forEach(([label, size]) => {
       const el = document.createElement('div');
       el.className = 'kb-key';
-      if (label === '') { el.classList.add('empty'); el.textContent = ''; }
-      else {
-        el.textContent = label;
-        if (['Backspace','Tab','CapsLock','Enter','Shift','Ctrl','Alt','Win','Menu'].includes(label))
-          el.classList.add('wide');
-        if (label === 'Space') el.classList.add('space');
-        if (['Esc','F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12','PrtSc','ScrLk','Pause',
-             'Insert','Home','PageUp','Delete','End','PageDown','Up','Down','Left','Right'].includes(label))
-          el.classList.add('special');
 
-        const isMod = ['Shift','Ctrl','Alt','Win'].includes(label);
-        if (isMod) {
-          // Modifier keys: press / release on pointer events
-          el.addEventListener('pointerdown', (e) => {
-            e.preventDefault();
-            const code = keyMap[label];
-            if (code) {
-              sendHTTP('/key_down?key=' + code);
-              el.classList.add('mod-down');
-            }
-          });
-          el.addEventListener('pointerup', (e) => {
-            e.preventDefault();
-            const code = keyMap[label];
-            if (code) {
-              sendHTTP('/key_up?key=' + code);
-              el.classList.remove('mod-down');
-            }
-          });
-          el.addEventListener('pointerleave', () => {
-            if (el.classList.contains('mod-down')) {
-              const code = keyMap[label];
-              if (code) sendHTTP('/key_up?key=' + code);
-              el.classList.remove('mod-down');
-            }
-          });
-        } else {
-          // Normal key: tap and highlight
-          el.addEventListener('click', () => {
-            let code = keyMap[label];
-            if (code) sendHTTP('/key?key=' + code);
-            else if (label.length === 1) sendHTTP('/type?text=' + encodeURIComponent(label));
-            else sendHTTP('/key?key=' + label);
-            highlightKey(el);
-          });
-        }
+      if (size) {
+        el.classList.add(size);
       }
-      grid.appendChild(el);
-    });
-  });
-}
 
-// ========== NUMPAD ==========
-const numpadLayout = [
-  ['NumLock','Num /','Num *','Num -'],
-  ['7','8','9','Num +'],
-  ['4','5','6'],
-  ['1','2','3','Num Enter'],
-  ['0','.','Num Enter']
-];
-function buildNumpad() {
-  const container = document.getElementById('numpad');
-  container.innerHTML = '';
-  numpadLayout.forEach(row => {
-    row.forEach(label => {
-      const el = document.createElement('div');
-      el.className = 'kb-key';
-      if (label === 'Num +' || label === 'Num Enter') el.classList.add('tall');
-      if (label === '0') el.classList.add('zero');
       el.textContent = label;
-      const isMod = ['NumLock'].includes(label);
+
+      if ([
+        'Esc','F1','F2','F3','F4','F5','F6','F7','F8',
+        'F9','F10','F11','F12','PrtSc','ScrLk','Pause'
+      ].includes(label)) {
+        el.classList.add('special');
+      }
+
+      const isMod = ['Shift','Ctrl','Alt','Win'].includes(label);
+
       if (isMod) {
-        el.addEventListener('pointerdown', (e) => {
+        el.addEventListener('pointerdown', e => {
           e.preventDefault();
+
           const code = keyMap[label];
-          if (code) { sendHTTP('/key_down?key=' + code); el.classList.add('mod-down'); }
+
+          if (code) {
+            sendHTTP('/key_down?key=' + code);
+            el.classList.add('mod-down');
+          }
         });
-        el.addEventListener('pointerup', (e) => {
+
+        el.addEventListener('pointerup', e => {
           e.preventDefault();
+
           const code = keyMap[label];
-          if (code) { sendHTTP('/key_up?key=' + code); el.classList.remove('mod-down'); }
-        });
-        el.addEventListener('pointerleave', () => {
-          if (el.classList.contains('mod-down')) {
-            const code = keyMap[label];
-            if (code) sendHTTP('/key_up?key=' + code);
+
+          if (code) {
+            sendHTTP('/key_up?key=' + code);
             el.classList.remove('mod-down');
           }
         });
+
+        el.addEventListener('pointerleave', () => {
+          if (el.classList.contains('mod-down')) {
+            const code = keyMap[label];
+
+            if (code) {
+              sendHTTP('/key_up?key=' + code);
+            }
+
+            el.classList.remove('mod-down');
+          }
+        });
+
       } else {
+
         el.addEventListener('click', () => {
           let code = keyMap[label];
-          if (code) sendHTTP('/key?key=' + code);
-          else if (label.length === 1) sendHTTP('/type?text=' + encodeURIComponent(label));
-          else sendHTTP('/key?key=' + label);
+
+          if (code) {
+            sendHTTP('/key?key=' + code);
+          }
+          else if (label.length === 1) {
+            sendHTTP('/type?text=' + encodeURIComponent(label));
+          }
+          else {
+            sendHTTP('/key?key=' + label);
+          }
+
           highlightKey(el);
         });
       }
-      container.appendChild(el);
+
+      rowEl.appendChild(el);
     });
+
+    grid.appendChild(rowEl);
   });
+}
+
+function buildNumpad() {
+  const container = document.getElementById('numpad');
+  container.innerHTML = '';
+
+  const keys = [
+    ['NumLock', 1, 1],
+    ['Num /',   1, 1],
+    ['Num *',   1, 1],
+    ['Num -',   1, 1],
+
+    ['7', 1, 1],
+    ['8', 1, 1],
+    ['9', 1, 1],
+
+    ['4', 1, 1],
+    ['5', 1, 1],
+    ['6', 1, 1],
+
+    ['1', 1, 1],
+    ['2', 1, 1],
+    ['3', 1, 1],
+
+    ['0', 2, 1],
+    ['.', 1, 1]
+  ];
+
+  keys.forEach(([label, colSpan, rowSpan]) => {
+    const el = document.createElement('div');
+    el.className = 'kb-key';
+
+    if (colSpan === 2) {
+      el.style.gridColumn = 'span 2';
+    }
+
+    el.textContent = label;
+
+    const isNumLock = label === 'NumLock';
+
+    if (isNumLock) {
+      el.addEventListener('pointerdown', e => {
+        e.preventDefault();
+
+        const code = keyMap[label];
+
+        if (code) {
+          sendHTTP('/key_down?key=' + code);
+          el.classList.add('mod-down');
+        }
+      });
+
+      el.addEventListener('pointerup', e => {
+        e.preventDefault();
+
+        const code = keyMap[label];
+
+        if (code) {
+          sendHTTP('/key_up?key=' + code);
+          el.classList.remove('mod-down');
+        }
+      });
+
+      el.addEventListener('pointerleave', () => {
+        if (el.classList.contains('mod-down')) {
+          const code = keyMap[label];
+
+          if (code) {
+            sendHTTP('/key_up?key=' + code);
+          }
+
+          el.classList.remove('mod-down');
+        }
+      });
+
+    } else {
+      el.addEventListener('click', () => {
+        const code = keyMap[label];
+
+        if (code) {
+          sendHTTP('/key?key=' + code);
+        } else if (label.length === 1) {
+          sendHTTP('/type?text=' + encodeURIComponent(label));
+        } else {
+          sendHTTP('/key?key=' + label);
+        }
+
+        highlightKey(el);
+      });
+    }
+
+    container.appendChild(el);
+  });
+
+  const plus = document.createElement('div');
+  plus.className = 'kb-key';
+  plus.textContent = '+';
+  plus.style.gridColumn = '4';
+  plus.style.gridRow = '2 / span 2';
+
+  plus.addEventListener('click', () => {
+    sendHTTP('/key?key=KP_PLUS');
+    highlightKey(plus);
+  });
+
+  container.appendChild(plus);
+
+  const enter = document.createElement('div');
+  enter.className = 'kb-key';
+  enter.textContent = 'Enter';
+  enter.style.gridColumn = '4';
+  enter.style.gridRow = '4 / span 2';
+
+  enter.addEventListener('click', () => {
+    sendHTTP('/key?key=KP_ENTER');
+    highlightKey(enter);
+  });
+
+  container.appendChild(enter);
 }
 
 buildKeyboard();
@@ -961,21 +1483,236 @@ logInfo('Modifiers reset');
 </html>
 )rawliteral";
 
+// STA configuration page (separate) – now auto-scans on load
+// ---- Updated STA page HTML (sta_html) ----
+const char sta_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WiFi Settings</title>
+<style>
+  body { font-family: 'Segoe UI', Roboto, sans-serif; background: #0b0b0b; color: #eee; padding: 20px; }
+  .container { max-width: 500px; margin: 0 auto; background: #1e1e1e; border-radius: 16px; padding: 24px; border: 1px solid #333; }
+  h2 { color: #5b9aff; text-align: center; }
+  label { display: block; margin: 12px 0 4px; color: #aaa; }
+  input[type=text], input[type=password] { width: 100%; padding: 8px; background: #222; border: 1px solid #444; border-radius: 6px; color: #eee; }
+  input[type=checkbox] { margin-right: 8px; }
+  button { padding: 10px 20px; background: #5b9aff; border: none; border-radius: 8px; color: #fff; font-weight: bold; cursor: pointer; margin-top: 12px; }
+  button:hover { background: #3a7bbd; }
+  button.secondary { background: #444; }
+  button.secondary:hover { background: #555; }
+  .status-box { background: #111; padding: 10px; border-radius: 8px; margin: 12px 0; }
+  .connected { color: #2ecc71; }
+  .disconnected { color: #e74c3c; }
+  .info { color: #aaa; font-size: 14px; }
+  .network-list { max-height: 200px; overflow-y: auto; background: #111; border-radius: 6px; padding: 4px; margin-top: 6px; }
+  .network-item { padding: 6px 8px; cursor: pointer; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; }
+  .network-item:hover { background: #2a2a2a; }
+  .network-item .bssid { color: #888; font-size: 12px; }
+  .network-item .rssi { color: #666; font-size: 12px; }
+  .network-item .enc { color: #5b9aff; font-size: 12px; }
+  .hidden-note { background: #2a2a2a; padding: 8px; border-radius: 6px; margin: 8px 0; font-size: 14px; border-left: 3px solid #f39c12; }
+  .scanning-msg { text-align: center; color: #aaa; padding: 10px; }
+  .error-msg { color: #e74c3c; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h2>🔧 WiFi Settings</h2>
+  <div id="statusBox" class="status-box">Loading...</div>
+
+  <div class="hidden-note">
+    ⚠️ <strong>Hidden networks</strong> do not appear in scans. If your network is hidden,
+    manually enter its SSID and BSSID (MAC) below, then tick the “Hidden network” checkbox.
+  </div>
+
+  <label>SSID</label>
+  <input type="text" id="ssid" placeholder="Network name">
+
+  <!-- No Scan button – scanning happens automatically on page load -->
+  <div id="networkList" class="network-list">
+    <div class="scanning-msg">Scanning for networks...</div>
+  </div>
+
+  <label>Password</label>
+  <input type="password" id="pass" placeholder="Password">
+
+  <label>BSSID (MAC) <span class="info">(optional, useful for hidden networks)</span></label>
+  <input type="text" id="bssid" placeholder="xx:xx:xx:xx:xx:xx">
+
+  <label>
+    <input type="checkbox" id="hiddenCheck"> Hidden network
+  </label>
+
+  <button onclick="connect()">Connect</button>
+  <button onclick="disconnect()" class="secondary">Disconnect</button>
+  <button onclick="forget()" class="secondary" style="background:#722;">Forget</button>
+  <br>
+  <button onclick="window.location.href='/'" style="background:#333;">← Back to HID</button>
+</div>
+
+<script>
+function updateStatus() {
+  fetch('/sta/status')
+    .then(r => r.json())
+    .then(data => {
+      const box = document.getElementById('statusBox');
+      if (data.connected) {
+        box.innerHTML = `<span class="connected">Connected</span> to <strong>${data.ssid}</strong><br>IP: ${data.ip}`;
+      } else {
+        box.innerHTML = `<span class="disconnected">Disconnected</span> – ${data.error || 'Idle'}`;
+      }
+    })
+    .catch(() => {});
+}
+setInterval(updateStatus, 2000);
+updateStatus();
+
+let scanAttempts = 0;
+const MAX_SCAN_ATTEMPTS = 10;
+
+function scanNetworks() {
+  const listDiv = document.getElementById('networkList');
+  listDiv.innerHTML = '<div class="scanning-msg">Scanning...</div>';
+  fetch('/sta/scan')
+    .then(r => r.json())
+    .then(data => {
+      if (data.scanning) {
+        // Still scanning – retry after 2 seconds
+        listDiv.innerHTML = '<div class="scanning-msg">Scanning, please wait...</div>';
+        if (++scanAttempts < MAX_SCAN_ATTEMPTS) {
+          setTimeout(scanNetworks, 2000);
+        } else {
+          listDiv.innerHTML = '<div class="scanning-msg error-msg">Scan timed out. <a href="javascript:scanNetworks()">Retry</a></div>';
+          scanAttempts = 0;
+        }
+        return;
+      }
+      // Scan completed – check if we got an array
+      if (data.length === 0) {
+        listDiv.innerHTML = '<div class="scanning-msg">No networks found. Make sure you are in range.</div>';
+        scanAttempts = 0;
+        return;
+      }
+      // Build the network list
+      let html = '';
+      data.forEach(net => {
+        const ssid = net.ssid || '(hidden)';
+        html += `<div class="network-item" onclick="selectNetwork('${ssid.replace(/'/g, "\\'")}', '${net.bssid}')">
+          <span><strong>${ssid}</strong> <span class="bssid">(${net.bssid})</span></span>
+          <span>
+            <span class="enc">${net.encryption_str}</span>
+            <span class="rssi">RSSI: ${net.rssi}</span>
+          </span>
+        </div>`;
+      });
+      listDiv.innerHTML = html;
+      scanAttempts = 0;
+    })
+    .catch(() => {
+      listDiv.innerHTML = '<div class="scanning-msg error-msg">Error scanning. <a href="javascript:scanNetworks()">Retry</a></div>';
+    });
+}
+
+function selectNetwork(ssid, bssid) {
+  document.getElementById('ssid').value = ssid;
+  document.getElementById('bssid').value = bssid;
+}
+
+function connect() {
+  const ssid = document.getElementById('ssid').value.trim();
+  const pass = document.getElementById('pass').value;
+  const bssid = document.getElementById('bssid').value.trim();
+  const hidden = document.getElementById('hiddenCheck').checked;
+
+  if (!ssid) { alert('SSID required'); return; }
+  const params = new URLSearchParams();
+  params.append('ssid', ssid);
+  params.append('pass', pass);
+  params.append('hidden', hidden ? '1' : '0');
+  if (bssid) params.append('bssid', bssid);
+
+  fetch('/sta/connect?' + params.toString())
+    .then(res => {
+      if (res.ok) {
+        alert('Connecting... check status.');
+        setTimeout(updateStatus, 1000);
+      } else {
+        alert('Failed to send connect request.');
+      }
+    })
+    .catch(() => alert('Network error.'));
+}
+
+function disconnect() {
+  fetch('/sta/disconnect').then(() => { updateStatus(); });
+}
+
+function forget() {
+  if (confirm('Forget saved WiFi credentials?')) {
+    fetch('/sta/forget').then(() => { updateStatus(); });
+  }
+}
+
+// Auto-scan when page loads, with a small delay to let the ESP settle
+window.onload = function() {
+  setTimeout(scanNetworks, 500);
+};
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Web server handlers ----------
 void handleRoot() {
   server.send(200, "text/html", index_html);
 }
 
+void handleSTA() {
+  server.send(200, "text/html", sta_html);
+}
+
+// ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
+  LOG_INFO("ESP32 HID Controller starting...");
+
+  // USB HID
   Mouse.begin();
   Keyboard.begin();
   USB.begin();
-  WiFi.softAP(ssid, password);
-  IPAddress apIP = WiFi.softAPIP();
-  Serial.println("AP IP: " + apIP.toString());
-  dnsServer.start(53, "*", apIP);
+  LOG_INFO("USB HID initialized");
 
+  // Load persistent settings
+  loadSettings();
+
+  // AP mode
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_password);
+  IPAddress apIP = WiFi.softAPIP();
+  LOG_INFO("AP mode started, IP: %s", apIP.toString().c_str());
+
+  // DNS
+  dnsServer.start(53, "*", apIP);
+  LOG_INFO("DNS server started");
+
+  // STA: load saved config and connect
+  WiFi.onEvent(WiFiEvent);
+  loadSTAConfig();
+
+  // Web server
   server.on("/", handleRoot);
+  server.on("/sta", handleSTA);
+  server.on("/sta/status", handleSTAStatus);
+  server.on("/sta/scan", handleSTAScan);
+  server.on("/sta/connect", handleSTAConnect);
+  server.on("/sta/disconnect", handleSTADisconnect);
+  server.on("/sta/forget", handleSTAForget);
+  server.on("/logs", handleLogs);
+
+  // HID endpoints
   server.on("/move", handleMove);
   server.on("/click", handleClick);
   server.on("/double", handleDoubleClick);
@@ -991,17 +1728,54 @@ void setup() {
   server.on("/key_up", handleKeyUp);
   server.on("/toggle_modifier", handleToggleModifier);
   server.on("/reset_modifiers", handleResetModifiers);
-  server.onNotFound([]() { server.send(200, "text/html", index_html); });
+  server.onNotFound([]() {
+    server.send(200, "text/html", index_html);
+  });
 
   server.begin();
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
-  Serial.println("Server ready");
+
+  LOG_INFO("HTTP server and WebSocket started");
+  LOG_INFO("Setup complete.");
 }
 
 void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
   webSocket.loop();
+
+  // STA retry logic
+  if (connecting && WiFi.status() != WL_CONNECTED) {
+    if (millis() - connectStartTime > CONNECT_TIMEOUT) {
+      if (sta_retry_count < MAX_RETRIES) {
+        sta_retry_count++;
+        sta_error = "Timeout, retry " + String(sta_retry_count) + "/" + String(MAX_RETRIES);
+        LOG_WARN("STA connection timeout, retry %d/%d", sta_retry_count, MAX_RETRIES);
+
+        // allow a new connection by clearing 'connecting'
+        connecting = false;
+
+        preferences.begin("wifi", true);
+        String ssid = preferences.getString("ssid", "");
+        String pass = preferences.getString("pass", "");
+        bool hidden = preferences.getBool("hidden", false);
+        String bssid = preferences.getString("bssid", "");
+        preferences.end();
+
+        if (ssid.length() > 0) {
+          connectSTA(ssid, pass, hidden, bssid);
+        } else {
+          sta_error = "No saved credentials";
+          LOG_ERROR("No saved credentials for retry");
+        }
+      } else {
+        connecting = false;
+        sta_error = "Max retries exceeded";
+        LOG_ERROR("STA max retries exceeded");
+      }
+    }
+  }
+
   delay(1);
 }
