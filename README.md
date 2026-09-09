@@ -1,6 +1,7 @@
-# ESP32-HID-Web-Remote-Controller - V6
+# ESP32-HID-Web-Remote-Controller - V7
 
-**ESP32‑S3 Wi‑Fi to USB HID bridge with web‑based mouse/keyboard control, captive portal, STA/AP mode, auto‑channel selection, hidden SSID, and **over‑the‑air (OTA) firmware updates**.**  
+**ESP32‑S3 Wi‑Fi to USB HID bridge with web‑based mouse/keyboard control, captive portal, STA/AP mode, auto‑channel selection, hidden SSID, over‑the‑air (OTA) firmware updates, consumer controls (media keys), gyro mouse support, mDNS, Wi‑Fi power management, and idle sleep.**
+
 Control your computer or TV wirelessly from your phone or tablet – settings survive power cycles.
 
 [![GitHub release](https://img.shields.io/github/v/release/Aminiow/ESP32-HID-Web-Remote-Controller)](https://github.com/Aminiow/ESP32-HID-Web-Remote-Controller/releases)
@@ -14,20 +15,38 @@ Control your computer or TV wirelessly from your phone or tablet – settings su
 - 🖱 **Mouse** – move, click (left/right/middle), double‑click, press/release, scroll wheel.
 - ⌨ **Keyboard** – type text, send key taps (including special keys), press & hold modifiers (Ctrl, Alt, Shift, Win).
 - 🔧 **Sticky modifiers** – tap to toggle Ctrl, Alt, Shift, Win (visual feedback on web UI).
-- 💾 **Persistent settings** – sensitivity, repeat interval, and legacy mode are saved in flash (Preferences) and restored after power‑cycle.
+- 💾 **Persistent settings** – sensitivity, repeat interval, legacy mode, boot protocol, gyro enable, TX power, and power save are saved in flash and restored after power‑cycle.
 - 📶 **Wi‑Fi Access Point** – creates its own network with **auto‑channel selection** (scans for the least crowded channel).
 - 🔒 **Hidden SSID** – the AP name (`ESP32-Mouse`) is hidden by default for privacy (can be changed in code).
 - 🔗 **STA (Client) Mode** – can simultaneously connect to an existing Wi‑Fi network. Credentials are saved and auto‑reconnect with retries.
 - 📡 **Wi‑Fi scanning** – scan for networks and connect via the web interface (supports WPA3 and hidden networks).
 - 🔁 **Automatic retry** – if STA connection fails, it will retry up to 3 times with a configurable delay.
-- 🔗 **Captive Portal** – any DNS request resolves to the ESP32; any HTTP request **redirects** to the web UI (HTTP 302).
+- 🔗 **Captive Portal** – any DNS request resolves to the ESP32; any HTTP request redirects to the web UI (HTTP 302).
 - 📱 **Responsive Web Interface** – works on phones, tablets, and desktops; touch‑friendly with a mouse pad.
 - 📊 **On‑board logging** – view logs in the web UI to help debug; raw logs available at `/logs` (JSON).
-- 🎛 **Adjustable Settings** – sensitivity, repeat interval, and legacy mode (slower key presses for older hosts) – settings are saved automatically with debounced HTTP requests.
+- 🎛 **Adjustable Settings** – sensitivity, repeat interval, legacy mode (slower key presses for older hosts), boot protocol (keyboard compatibility), TX power, and power save – settings are saved automatically with debounced HTTP requests.
 - ⚡ **USB HID** – uses TinyUSB to emulate a standard USB mouse and keyboard – works out‑of‑the‑box on most OSes (Windows, macOS, Linux, Android, smart TVs).
 - 🔄 **Robust USB enumeration** – `USB.begin()` is called first, ensuring the host detects the device reliably.
 - 🛡 **JSON escaping** – all API responses are properly JSON‑escaped to prevent injection.
 - 🚀 **Over‑the‑Air (OTA) Firmware Updates** – check for new firmware from a remote server, download and verify with SHA‑256, then reboot. Also supports manual upload of `.bin` files via the web UI.
+- 🎛️ **Consumer Controls (Media Keys)** – volume up/down, mute, channel up/down, power, input select – perfect for controlling TVs and media players.
+- 📱 **Gyro Mouse Support** – use your phone's orientation sensors to move the cursor by tilting the device.
+- 🌐 **mDNS** – access the web interface at `esp32-mouse.local` (if your device supports mDNS/Bonjour).
+- 🔋 **Wi‑Fi Power Management** – adjustable TX power (0–20 dBm) and modem sleep to reduce power consumption.
+- 😴 **Idle Sleep** – when no Wi‑Fi clients are connected and STA is inactive, the ESP32 enters light sleep (reduces CPU frequency and enables maximum modem sleep) to save power.
+
+---
+
+## 🆕 What's New in v7
+
+- **Consumer Control (Media Keys)** – send volume, mute, channel, power, and input commands directly from the web UI.
+- **Gyro Mouse Control** – use your phone's accelerometer/gyroscope to control the cursor by tilting the device.
+- **mDNS Support** – access the web UI at `esp32-mouse.local` (Bonjour/mDNS).
+- **Wi‑Fi Power Management** – adjust TX power (0–20 dBm) and enable/disable modem sleep for power saving.
+- **Idle Sleep** – automatically enters light sleep when no clients are connected, reducing power consumption.
+- **Boot Protocol Mode** – improves keyboard compatibility with older BIOS/UEFI systems by sending empty reports between keystrokes.
+- **Firmware Update Status API** – query the update status via `/update_status` and trigger updates with `/trigger_update`.
+- **Expanded Settings** – boot protocol, gyro enable, TX power, and power save are now persisted in Preferences.
 
 ---
 
@@ -52,11 +71,15 @@ Required libraries (install via Arduino Library Manager or PlatformIO):
 - `USB` (built‑in)
 - `USBHIDMouse` (built‑in)
 - `USBHIDKeyboard` (built‑in)
+- `USBHIDConsumerControl` (built‑in) – **new in v7**
 - `Preferences` (built‑in)
 - `HTTPClient` (built‑in)
 - `Update` (built‑in)
 - `WiFiClientSecure` (built‑in)
 - `mbedtls` (built‑in)
+- `ESPmDNS` (built‑in) – **new in v7**
+- `esp_wifi` (built‑in) – **new in v7**
+- `esp_sleep` (built‑in) – **new in v7**
 
 ---
 
@@ -109,9 +132,9 @@ After flashing, the ESP32 will create the Wi‑Fi network **ESP32-Mouse** (passw
 ### Quick Start
 
 1. **Manually add** the Wi‑Fi network `ESP32-Mouse` (password `12345678`) on your phone/tablet/laptop (it won't appear in scans because it's hidden).
-2. **Open any web browser** and type any domain – the captive portal will redirect to `http://192.168.4.1/`.
+2. **Open any web browser** and type any domain – the captive portal will redirect to `http://192.168.4.1/` – or use `esp32-mouse.local` if mDNS is supported.
 3. **Plug the ESP32** into your computer/TV via USB‑C – it will be recognised as a mouse and keyboard.
-4. **Use the web UI** to control the cursor and type.
+4. **Use the web UI** to control the cursor, type, send media commands, and more.
 
 ### Web Interface
 
@@ -123,12 +146,11 @@ After flashing, the ESP32 will create the Wi‑Fi network **ESP32-Mouse** (passw
   - Shift toggles on click – useful for uppercase letters.
 - **Text input** – type arbitrary text (ASCII only) with one click.
 - **Real‑time input** – type live; backspace works.
-- **Settings** – sensitivity and repeat interval sliders, legacy mode checkbox (slower key timing). Settings are saved automatically to flash with debounce (400ms).
+- **Settings** – sensitivity, repeat interval, legacy mode, boot protocol, TX power, and power save. Settings are saved automatically to flash with debounce (400ms).
+- **Gyro Mouse** – enable to use your phone's orientation sensors to move the cursor. (On iOS, you may need to grant permission.)
+- **Media Controls** – volume up/down, mute, channel up/down, power, input select – perfect for TVs and media players.
 - **Logs** – view client‑side logs; raw logs available at `/logs` (JSON).
-- **Firmware Update** – (New in v6)
-  - Set the URLs for a version file and a firmware binary file (e.g., hosted on a web server).
-  - Click **Check for Update** – the ESP32 will fetch the remote version, compare it with the current one (`5.0.0`), and if newer, download and verify the firmware using SHA‑256 before updating.
-  - Alternatively, you can manually upload a `.bin` file using the file picker and **Upload & Update** button – this performs the update immediately.
+- **Firmware Update** – set URLs, check for updates, trigger updates, and upload `.bin` files manually.
 
 ### Wi‑Fi STA (Client) Mode
 
@@ -138,9 +160,28 @@ After flashing, the ESP32 will create the Wi‑Fi network **ESP32-Mouse** (passw
 4. Enter the password.
 5. Tick **Hidden network** if your network is hidden.
 6. Click **Connect** – the ESP32 will attempt to connect.
-7. The status will update automatically. Once connected, you can still access the web UI via the ESP32's AP IP (`192.168.4.1`).
+7. The status will update automatically. Once connected, you can still access the web UI via the ESP32's AP IP (`192.168.4.1`) or via `esp32-mouse.local`.
 
 > **Note:** The ESP32 remembers the STA credentials and will attempt to reconnect after each power‑cycle (with retries). If connection fails, it will retry up to 3 times with a 5‑second interval.
+
+### Media / Consumer Controls
+
+The **Media / TV** card provides buttons for common consumer control commands:
+- 🔊 Volume Up/Down
+- 🔇 Mute
+- 📺 Channel Up/Down
+- ⏻ Power
+- 📡 Input Select
+
+These commands are sent via the USB HID Consumer Control interface and work with most TVs, media players, and computers that support USB HID consumer controls.
+
+### Gyro Mouse Control
+
+Enable the **Gyro Mouse** checkbox to use your phone's orientation sensors:
+- Tilt the device forward/backward to move the cursor vertically.
+- Tilt left/right to move horizontally.
+- The sensitivity is controlled by the main **Sensitivity** slider.
+- On iOS, you may need to grant motion permission when prompted.
 
 ---
 
@@ -163,25 +204,34 @@ const char* ap_password = "12345678";
 
 ### Auto‑Channel Selection
 
-The ESP32 automatically scans nearby networks at boot and selects the least crowded channel (1-11) for its AP. This reduces interference and improves Wi‑Fi stability. The scan runs after USB enumeration, so it doesn't affect HID detection.
+The ESP32 automatically scans nearby networks at boot and selects the least crowded channel (1-11) for its AP. This reduces interference and improves Wi‑Fi stability.
 
 ### USB Enumeration Order
 
-v6 uses the proven order:
+v7 uses the proven order:
 ```cpp
 USB.begin();
 Keyboard.begin();
 Mouse.begin();
+ConsumerControl.begin();
 ```
 This ensures the host detects the device reliably on the first attempt, even on older TVs and computers.
 
-### Firmware Update URLs
+### Boot Protocol Mode
 
-The update mechanism requires two URLs:
-- **Version URL** – points to a plain text file containing the version string (e.g., `5.0.1`) and optionally a SHA‑256 hash of the firmware binary on the next line.
-- **Binary URL** – points to the actual firmware `.bin` file.
+When enabled, this sends an empty HID report between keystrokes, which improves compatibility with older BIOS/UEFI systems and some smart TVs that expect a clean release between key presses. Enable it via the web UI or by setting `bootProtocolMode = true` in Preferences.
 
-Both URLs are stored in Preferences and can be changed via the web UI or the `/set_urls` endpoint. The update check runs automatically once per day when STA is connected.
+### Wi‑Fi Power Management
+
+- **TX Power** – adjust the output power of the Wi‑Fi radio from 0 to 20 dBm. Lower values reduce power consumption and range.
+- **Power Save** – when enabled, the ESP32 enters modem sleep when the Wi‑Fi is idle, reducing power consumption. Disable for lower latency.
+
+### Idle Sleep
+
+When no Wi‑Fi clients are connected to the AP and STA is inactive for 60 seconds, the ESP32 enters a light sleep state:
+- CPU frequency is reduced to 80 MHz.
+- Maximum modem sleep is enabled.
+- The device wakes up immediately when a client connects or when the STA becomes active.
 
 ---
 
@@ -189,14 +239,17 @@ Both URLs are stored in Preferences and can be changed via the web UI or the `/s
 
 | Symptom | Possible cause / solution |
 |---------|---------------------------|
-| **TV/computer does not recognise USB HID** | 1. Ensure **USB CDC On Boot** is **Disabled** in board settings.<br>2. Try a different USB cable (data‑capable).<br>3. Power the ESP32 externally if the USB port can't supply enough current.<br>4. The code now uses `USB.begin(); Keyboard.begin(); Mouse.begin();` – this order is proven to work on most hosts.<br>5. If you have a USB‑C to USB‑A cable, ensure it has the proper pull‑up resistors (some cheap cables are charge‑only). |
+| **TV/computer does not recognise USB HID** | 1. Ensure **USB CDC On Boot** is **Disabled** in board settings.<br>2. Try a different USB cable (data‑capable).<br>3. Power the ESP32 externally if the USB port can't supply enough current.<br>4. The code uses `USB.begin(); Keyboard.begin(); Mouse.begin();` – this order works on most hosts.<br>5. If you have a USB‑C to USB‑A cable, ensure it has the proper pull‑up resistors. |
 | **Can’t find Wi‑Fi AP** | The SSID is **hidden**. Manually add the network `ESP32-Mouse` with password `12345678`. |
-| **Captive portal not redirecting** | Manually type `http://192.168.4.1` in your browser. |
+| **Captive portal not redirecting** | Manually type `http://192.168.4.1` or `esp32-mouse.local` in your browser. |
 | **Keyboard keys not sending** | Verify the USB connection and that the host has focus on a text field. |
-| **STA connection fails / retries** | Check the SSID and password. The ESP32 will retry up to 3 times. If it still fails, check the logs at `/logs` for details. |
-| **Settings not saved** | Ensure the Preferences namespace has enough space (default should be fine). Settings are saved to flash – they persist across power‑cycles. |
-| **Wi‑Fi scan doesn't show networks** | Make sure you are in range and that the ESP32’s antenna is connected. On the STA settings page, click “Refresh” if the scan times out. |
-| **Firmware update fails** | Check that the version URL returns a valid text file with the correct format. The binary URL must point to a valid `.bin` file. If the SHA‑256 hash is provided, it must match the downloaded file. Also ensure the ESP32 has a stable Internet connection (STA mode). |
+| **STA connection fails / retries** | Check the SSID and password. The ESP32 will retry up to 3 times. Check logs at `/logs`. |
+| **Settings not saved** | Ensure the Preferences namespace has enough space. Settings persist across power‑cycles. |
+| **Wi‑Fi scan doesn't show networks** | Make sure you are in range and the antenna is connected. |
+| **Firmware update fails** | Check the version and binary URLs. The SHA‑256 hash must match (if provided). Ensure STA is connected. |
+| **Consumer controls not working** | Some hosts may not support consumer control commands. Test with a different device. |
+| **Gyro mouse not working** | On iOS, you must grant permission when prompted. Check that the browser supports `deviceorientation` events. |
+| **Web interface slow or unresponsive** | Disable power save or increase TX power. Ensure the device is not in idle sleep. |
 
 ---
 
