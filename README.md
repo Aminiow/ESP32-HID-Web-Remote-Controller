@@ -1,6 +1,6 @@
-# ESP32-HID-Web-Remote-Controller - V7
+# ESP32-HID-Web-Remote-Controller - v8
 
-**ESP32‑S3 Wi‑Fi to USB HID bridge with web‑based mouse/keyboard control, captive portal, STA/AP mode, auto‑channel selection, hidden SSID, over‑the‑air (OTA) firmware updates, consumer controls (media keys), gyro mouse support, mDNS, Wi‑Fi power management, and idle sleep.**
+**ESP32‑S3 Wi‑Fi to USB HID bridge with web‑based mouse/keyboard control, captive portal, STA/AP mode, auto‑channel selection, hidden SSID, over‑the‑air (OTA) firmware updates, consumer controls (media keys), gyro mouse support, mDNS, Wi‑Fi power management, idle sleep, and **SHA‑256 verified firmware uploads**.**
 
 Control your computer or TV wirelessly from your phone or tablet – settings survive power cycles.
 
@@ -29,24 +29,25 @@ Control your computer or TV wirelessly from your phone or tablet – settings su
 - 🔄 **Robust USB enumeration** – `USB.begin()` is called first, ensuring the host detects the device reliably.
 - 🛡 **JSON escaping** – all API responses are properly JSON‑escaped to prevent injection.
 - 🚀 **Over‑the‑Air (OTA) Firmware Updates** – check for new firmware from a remote server, download and verify with SHA‑256, then reboot. Also supports manual upload of `.bin` files via the web UI.
-- 🎛️ **Consumer Controls (Media Keys)** – volume up/down, mute, channel up/down, power, input select – perfect for controlling TVs and media players.
+- 🔐 **SHA‑256 Verified Uploads** – when uploading firmware manually, the ESP32 automatically fetches the expected hash from the version file (if WiFi is connected) and verifies the uploaded file before applying the update.
+- 🎛️ **Consumer Controls (Media Keys)** – volume up/down, mute, channel up/down, power, input menu, and input select – perfect for controlling TVs and media players.
 - 📱 **Gyro Mouse Support** – use your phone's orientation sensors to move the cursor by tilting the device.
 - 🌐 **mDNS** – access the web interface at `esp32-mouse.local` (if your device supports mDNS/Bonjour).
 - 🔋 **Wi‑Fi Power Management** – adjustable TX power (0–20 dBm) and modem sleep to reduce power consumption.
 - 😴 **Idle Sleep** – when no Wi‑Fi clients are connected and STA is inactive, the ESP32 enters light sleep (reduces CPU frequency and enables maximum modem sleep) to save power.
+- 📋 **Dynamic Version Display** – the web UI automatically shows the current firmware version in the page title, heading, and footer.
 
 ---
 
-## 🆕 What's New in v7
+## 🆕 What's New in v8
 
-- **Consumer Control (Media Keys)** – send volume, mute, channel, power, and input commands directly from the web UI.
-- **Gyro Mouse Control** – use your phone's accelerometer/gyroscope to control the cursor by tilting the device.
-- **mDNS Support** – access the web UI at `esp32-mouse.local` (Bonjour/mDNS).
-- **Wi‑Fi Power Management** – adjust TX power (0–20 dBm) and enable/disable modem sleep for power saving.
-- **Idle Sleep** – automatically enters light sleep when no clients are connected, reducing power consumption.
-- **Boot Protocol Mode** – improves keyboard compatibility with older BIOS/UEFI systems by sending empty reports between keystrokes.
-- **Firmware Update Status API** – query the update status via `/update_status` and trigger updates with `/trigger_update`.
-- **Expanded Settings** – boot protocol, gyro enable, TX power, and power save are now persisted in Preferences.
+- **SHA‑256 Verified Firmware Uploads** – when uploading a `.bin` file via the web UI, the ESP32 now fetches the expected hash from the version file (if WiFi is connected) and verifies the file before applying the update. This prevents corrupted or mismatched firmware from being installed.
+- **Dynamic Version Display** – the web page title, main heading, and footer now automatically display the current firmware version (fetched from `/update_status`).
+- **Improved Consumer Controls** – added `INPUT_MENU` (opens input menu) and `INPUT_SELECT` (direct input switch) for better TV/media control.
+- **`/get_urls` Endpoint** – new API endpoint to fetch the current update URLs, allowing the web UI to load and display them without hardcoding.
+- **Default Update URLs** – now point to the GitHub repository (`https://raw.githubusercontent.com/Aminiow/ESP32-HID-Web-Remote-Controller/main/version.txt` and `firmware.bin`) for easy out‑of‑the‑box updates.
+- **Version Bump** – firmware version is now `8.0.0`.
+- **HTML/UI Cleanup** – improved version display and update status handling.
 
 ---
 
@@ -71,15 +72,15 @@ Required libraries (install via Arduino Library Manager or PlatformIO):
 - `USB` (built‑in)
 - `USBHIDMouse` (built‑in)
 - `USBHIDKeyboard` (built‑in)
-- `USBHIDConsumerControl` (built‑in) – **new in v7**
+- `USBHIDConsumerControl` (built‑in)
 - `Preferences` (built‑in)
 - `HTTPClient` (built‑in)
 - `Update` (built‑in)
 - `WiFiClientSecure` (built‑in)
 - `mbedtls` (built‑in)
-- `ESPmDNS` (built‑in) – **new in v7**
-- `esp_wifi` (built‑in) – **new in v7**
-- `esp_sleep` (built‑in) – **new in v7**
+- `ESPmDNS` (built‑in)
+- `esp_wifi` (built‑in)
+- `esp_sleep` (built‑in)
 
 ---
 
@@ -103,6 +104,7 @@ cd ESP32-HID-Web-Remote-Controller
 - USB Mode: **USB‑OTG (TinyUSB)**
 - Upload Mode: **UART0 / Hardware CDC** (or **USB‑OTG** if using the native USB port for flashing)
 - USB CDC On Boot: **Disabled** (critical for HID)
+- USB Firmware MSC On Boot: **Enabled** (ESP32-S2/3 Only)
 - Upload Speed: 921600 (optional)
 
 **For PlatformIO – example `platformio.ini`:**
@@ -148,9 +150,9 @@ After flashing, the ESP32 will create the Wi‑Fi network **ESP32-Mouse** (passw
 - **Real‑time input** – type live; backspace works.
 - **Settings** – sensitivity, repeat interval, legacy mode, boot protocol, TX power, and power save. Settings are saved automatically to flash with debounce (400ms).
 - **Gyro Mouse** – enable to use your phone's orientation sensors to move the cursor. (On iOS, you may need to grant permission.)
-- **Media Controls** – volume up/down, mute, channel up/down, power, input select – perfect for TVs and media players.
+- **Media Controls** – volume up/down, mute, channel up/down, power, input menu, and input select – perfect for TVs and media players.
 - **Logs** – view client‑side logs; raw logs available at `/logs` (JSON).
-- **Firmware Update** – set URLs, check for updates, trigger updates, and upload `.bin` files manually.
+- **Firmware Update** – set URLs, check for updates, trigger updates, and upload `.bin` files manually. When uploading, the ESP32 will verify the SHA‑256 hash against the version file (if available).
 
 ### Wi‑Fi STA (Client) Mode
 
@@ -171,7 +173,8 @@ The **Media / TV** card provides buttons for common consumer control commands:
 - 🔇 Mute
 - 📺 Channel Up/Down
 - ⏻ Power
-- 📡 Input Select
+- 📡 Menu – opens the input source menu
+- 📡 Select – switches to a specific input (works on many TVs)
 
 These commands are sent via the USB HID Consumer Control interface and work with most TVs, media players, and computers that support USB HID consumer controls.
 
@@ -208,7 +211,7 @@ The ESP32 automatically scans nearby networks at boot and selects the least crow
 
 ### USB Enumeration Order
 
-v7 uses the proven order:
+v8 uses the proven order:
 ```cpp
 USB.begin();
 Keyboard.begin();
@@ -233,6 +236,14 @@ When no Wi‑Fi clients are connected to the AP and STA is inactive for 60 secon
 - Maximum modem sleep is enabled.
 - The device wakes up immediately when a client connects or when the STA becomes active.
 
+### Firmware Update URLs
+
+The update mechanism requires two URLs:
+- **Version URL** – points to a plain text file containing the version string (e.g., `8.0.0`) and optionally a SHA‑256 hash of the firmware binary on the next line.
+- **Binary URL** – points to the actual firmware `.bin` file.
+
+Default URLs point to the GitHub repository for easy updates. You can change them via the web UI or the `/set_urls` endpoint. When uploading firmware manually, the ESP32 will automatically fetch the expected hash from the version URL (if WiFi is connected) and verify the uploaded file.
+
 ---
 
 ## 🛠 Troubleshooting
@@ -247,9 +258,11 @@ When no Wi‑Fi clients are connected to the AP and STA is inactive for 60 secon
 | **Settings not saved** | Ensure the Preferences namespace has enough space. Settings persist across power‑cycles. |
 | **Wi‑Fi scan doesn't show networks** | Make sure you are in range and the antenna is connected. |
 | **Firmware update fails** | Check the version and binary URLs. The SHA‑256 hash must match (if provided). Ensure STA is connected. |
+| **Manual upload rejected with "Hash mismatch"** | The uploaded firmware file does not match the expected hash from the version file. Download a fresh copy or disable hash checking (only possible by modifying the code). |
 | **Consumer controls not working** | Some hosts may not support consumer control commands. Test with a different device. |
 | **Gyro mouse not working** | On iOS, you must grant permission when prompted. Check that the browser supports `deviceorientation` events. |
 | **Web interface slow or unresponsive** | Disable power save or increase TX power. Ensure the device is not in idle sleep. |
+| **Version not updating in UI** | Check that `/update_status` is reachable and returns valid JSON. The UI polls this endpoint every 30 seconds. |
 
 ---
 
