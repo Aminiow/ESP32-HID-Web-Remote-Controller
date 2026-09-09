@@ -1,10 +1,11 @@
-// v7
+// v8
 // Default SSID: ESP32-MOUSE
 // Default Password: 12345678
 // Default Setting:
 // - USB Mode: USB-OTG (TinyUSB)
 // - Upload Mode: UART0 / Hardware CDC
 // - USB CDC On Boot: Disabled
+// - USB Firmware MSC On Boot: Enabled (ESP32-S2/3 Only)
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -12,7 +13,7 @@
 #include <USB.h>
 #include <USBHIDMouse.h>
 #include <USBHIDKeyboard.h>
-#include <USBHIDConsumerControl.h>   // new
+#include <USBHIDConsumerControl.h>  // new
 #include <Preferences.h>
 #include <cstdarg>
 #include <cstdio>
@@ -21,13 +22,23 @@
 #include <Update.h>
 #include <WiFiClientSecure.h>
 #include <mbedtls/sha256.h>
-#include <ESPmDNS.h>                // new
-#include <esp_wifi.h>               // for TX power & power save
-#include <esp_sleep.h>              // for sleep modes
+#include <ESPmDNS.h>    // new
+#include <esp_wifi.h>   // for TX power & power save
+#include <esp_sleep.h>  // for sleep modes
+
+// Consumer Control HID Usage IDs (Page 0x0C)
+#define CONSUMER_VOLUME_INCREMENT 0xE9
+#define CONSUMER_VOLUME_DECREMENT 0xEA
+#define CONSUMER_MUTE 0xE2
+#define CONSUMER_CHANNEL_INCREMENT 0x9C
+#define CONSUMER_CHANNEL_DECREMENT 0x9D
+#define CONSUMER_POWER 0x30
+#define CONSUMER_INPUT_MENU 0x40    // "Menu" – often opens input list
+#define CONSUMER_INPUT_SELECT 0x8A  // "Input Select" – direct switch
 
 USBHIDMouse Mouse;
 USBHIDKeyboard Keyboard;
-USBHIDConsumerControl ConsumerControl;   // new
+USBHIDConsumerControl ConsumerControl;  // new
 WebServer server(80);
 DNSServer dnsServer;
 WebSocketsServer webSocket(81);
@@ -39,8 +50,8 @@ const char* ap_password = "12345678";
 float sensitivity = 2.0f;
 int repeatInterval = 100;
 bool legacyMode = false;
-bool bootProtocolMode = false;        // new: keyboard compatibility
-bool gyroEnabled = false;            // new: gyro mouse control
+bool bootProtocolMode = false;  // new: keyboard compatibility
+bool gyroEnabled = false;       // new: gyro mouse control
 
 bool ctrlSticky = false;
 bool altSticky = false;
@@ -67,22 +78,22 @@ bool retryPending = false;
 bool staStarted = false;
 
 // Firmware update globals
-#define FW_VERSION_MAJOR 5
+#define FW_VERSION_MAJOR 8
 #define FW_VERSION_MINOR 0
 #define FW_VERSION_PATCH 0
-#define FW_VERSION_STR "5.0.0"
+#define FW_VERSION_STR "8.0.0"
 String updateVersionUrl = "";
 String updateBinUrl = "";
 bool updateInProgress = false;
-bool updateAvailable = false;          // new
+bool updateAvailable = false;  // new
 String newVersion = "";
 String newHash = "";
 
 // Wi‑Fi power settings
-int8_t txPower = 20;                  // in dBm, default 20
-bool powerSaveEnabled = true;         // enable modem sleep
-bool idleSleepActive = false;         // flag for light sleep state
-unsigned long lastClientActivity = 0; // for idle detection
+int8_t txPower = 20;                   // in dBm, default 20
+bool powerSaveEnabled = true;          // enable modem sleep
+bool idleSleepActive = false;          // flag for light sleep state
+unsigned long lastClientActivity = 0;  // for idle detection
 
 // Log buffer
 #define MAX_LOG_ENTRIES 200
@@ -123,7 +134,8 @@ int16_t clamp(int16_t v, int16_t minv, int16_t maxv) {
 }
 
 String jsonEscape(const String& input) {
-  String out; out.reserve(input.length() + 8);
+  String out;
+  out.reserve(input.length() + 8);
   for (size_t i = 0; i < input.length(); ++i) {
     char c = input.charAt(i);
     switch (c) {
@@ -135,48 +147,84 @@ String jsonEscape(const String& input) {
       case '\b': out += "\\b"; break;
       case '\f': out += "\\f"; break;
       default:
-        if ((uint8_t)c < 0x20) { char buf[7]; snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c); out += buf; }
-        else out += c;
+        if ((uint8_t)c < 0x20) {
+          char buf[7];
+          snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+          out += buf;
+        } else out += c;
         break;
     }
   }
   return out;
 }
 
-bool effectiveCtrl() { return ctrlSticky || ctrlHeld > 0; }
-bool effectiveAlt() { return altSticky || altHeld > 0; }
-bool effectiveShift() { return shiftSticky || shiftHeld > 0; }
-bool effectiveWin() { return winSticky || winHeld > 0; }
+bool effectiveCtrl() {
+  return ctrlSticky || ctrlHeld > 0;
+}
+bool effectiveAlt() {
+  return altSticky || altHeld > 0;
+}
+bool effectiveShift() {
+  return shiftSticky || shiftHeld > 0;
+}
+bool effectiveWin() {
+  return winSticky || winHeld > 0;
+}
 
 void applyModifiers() {
-  if (effectiveCtrl()) Keyboard.press(KEY_LEFT_CTRL); else Keyboard.release(KEY_LEFT_CTRL);
-  if (effectiveAlt()) Keyboard.press(KEY_LEFT_ALT); else Keyboard.release(KEY_LEFT_ALT);
-  if (effectiveShift()) Keyboard.press(KEY_LEFT_SHIFT); else Keyboard.release(KEY_LEFT_SHIFT);
-  if (effectiveWin()) Keyboard.press(KEY_LEFT_GUI); else Keyboard.release(KEY_LEFT_GUI);
+  if (effectiveCtrl()) Keyboard.press(KEY_LEFT_CTRL);
+  else Keyboard.release(KEY_LEFT_CTRL);
+  if (effectiveAlt()) Keyboard.press(KEY_LEFT_ALT);
+  else Keyboard.release(KEY_LEFT_ALT);
+  if (effectiveShift()) Keyboard.press(KEY_LEFT_SHIFT);
+  else Keyboard.release(KEY_LEFT_SHIFT);
+  if (effectiveWin()) Keyboard.press(KEY_LEFT_GUI);
+  else Keyboard.release(KEY_LEFT_GUI);
 }
 
 void releaseAllModifiers() {
-  ctrlSticky = false; altSticky = false; shiftSticky = false; winSticky = false;
-  ctrlHeld = 0; altHeld = 0; shiftHeld = 0; winHeld = 0;
-  Keyboard.release(KEY_LEFT_CTRL); Keyboard.release(KEY_LEFT_ALT); Keyboard.release(KEY_LEFT_SHIFT); Keyboard.release(KEY_LEFT_GUI);
+  ctrlSticky = false;
+  altSticky = false;
+  shiftSticky = false;
+  winSticky = false;
+  ctrlHeld = 0;
+  altHeld = 0;
+  shiftHeld = 0;
+  winHeld = 0;
+  Keyboard.release(KEY_LEFT_CTRL);
+  Keyboard.release(KEY_LEFT_ALT);
+  Keyboard.release(KEY_LEFT_SHIFT);
+  Keyboard.release(KEY_LEFT_GUI);
   LOG_INFO("All modifiers released");
 }
 
-bool isModifierCode(uint8_t code) { return code == KEY_LEFT_CTRL || code == KEY_LEFT_ALT || code == KEY_LEFT_SHIFT || code == KEY_LEFT_GUI; }
+bool isModifierCode(uint8_t code) {
+  return code == KEY_LEFT_CTRL || code == KEY_LEFT_ALT || code == KEY_LEFT_SHIFT || code == KEY_LEFT_GUI;
+}
 
 void modifierHeldDown(uint8_t code) {
-  if (code == KEY_LEFT_CTRL) { if (ctrlHeld < 255) ctrlHeld++; }
-  else if (code == KEY_LEFT_ALT) { if (altHeld < 255) altHeld++; }
-  else if (code == KEY_LEFT_SHIFT) { if (shiftHeld < 255) shiftHeld++; }
-  else if (code == KEY_LEFT_GUI) { if (winHeld < 255) winHeld++; }
+  if (code == KEY_LEFT_CTRL) {
+    if (ctrlHeld < 255) ctrlHeld++;
+  } else if (code == KEY_LEFT_ALT) {
+    if (altHeld < 255) altHeld++;
+  } else if (code == KEY_LEFT_SHIFT) {
+    if (shiftHeld < 255) shiftHeld++;
+  } else if (code == KEY_LEFT_GUI) {
+    if (winHeld < 255) winHeld++;
+  }
   applyModifiers();
 }
 
 void modifierHeldUp(uint8_t code) {
-  if (code == KEY_LEFT_CTRL) { if (ctrlHeld > 0) ctrlHeld--; }
-  else if (code == KEY_LEFT_ALT) { if (altHeld > 0) altHeld--; }
-  else if (code == KEY_LEFT_SHIFT) { if (shiftHeld > 0) shiftHeld--; }
-  else if (code == KEY_LEFT_GUI) { if (winHeld > 0) winHeld--; }
+  if (code == KEY_LEFT_CTRL) {
+    if (ctrlHeld > 0) ctrlHeld--;
+  } else if (code == KEY_LEFT_ALT) {
+    if (altHeld > 0) altHeld--;
+  } else if (code == KEY_LEFT_SHIFT) {
+    if (shiftHeld > 0) shiftHeld--;
+  } else if (code == KEY_LEFT_GUI) {
+    if (winHeld > 0) winHeld--;
+  }
   applyModifiers();
 }
 
@@ -185,7 +233,10 @@ bool toggleModifier(const String& mod) {
   else if (mod == "ALT") altSticky = !altSticky;
   else if (mod == "SHIFT") shiftSticky = !shiftSticky;
   else if (mod == "WIN") winSticky = !winSticky;
-  else { LOG_WARN("Invalid modifier: %s", mod.c_str()); return false; }
+  else {
+    LOG_WARN("Invalid modifier: %s", mod.c_str());
+    return false;
+  }
   applyModifiers();
   bool state = false;
   if (mod == "CTRL") state = ctrlSticky;
@@ -231,7 +282,7 @@ void saveSettings() {
 
 // ------------------- Wi‑Fi power functions -------------------
 void applyTxPower() {
-  int8_t val = txPower * 4; // 0.25 dBm steps
+  int8_t val = txPower * 4;  // 0.25 dBm steps
   if (val > 84) val = 84;
   if (val < 0) val = 0;
   esp_wifi_set_max_tx_power(val);
@@ -251,8 +302,8 @@ void applyPowerSave() {
 // ------------------- Update URL storage -------------------
 void loadUpdateUrls() {
   preferences.begin("updates", true);
-  updateVersionUrl = preferences.getString("verUrl", "https://example.com/version.txt");
-  updateBinUrl = preferences.getString("binUrl", "https://example.com/firmware.bin");
+  updateVersionUrl = preferences.getString("verUrl", "https://raw.githubusercontent.com/Aminiow/ESP32-HID-Web-Remote-Controller/main/version.txt");
+  updateBinUrl = preferences.getString("binUrl", "https://raw.githubusercontent.com/Aminiow/ESP32-HID-Web-Remote-Controller/main/firmware.bin");
   preferences.end();
 }
 
@@ -272,13 +323,22 @@ bool fetchVersionInfo(const String& url, String& version, String& hash) {
   http.begin(url);
   http.setTimeout(5000);
   int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); return false; }
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
   String payload = http.getString();
   http.end();
   int nl = payload.indexOf('\n');
-  if (nl == -1) { version = payload; hash = ""; }
-  else { version = payload.substring(0, nl); hash = payload.substring(nl + 1); }
-  version.trim(); hash.trim();
+  if (nl == -1) {
+    version = payload;
+    hash = "";
+  } else {
+    version = payload.substring(0, nl);
+    hash = payload.substring(nl + 1);
+  }
+  version.trim();
+  hash.trim();
   return true;
 }
 
@@ -321,7 +381,10 @@ bool downloadAndVerify(const String& url, const String& expectedHash, int maxRet
       if (avail) {
         size_t toRead = min(avail, (size_t)1024);
         size_t bytes = stream->readBytes(buf, toRead);
-        if (bytes == 0) { delay(10); continue; }
+        if (bytes == 0) {
+          delay(10);
+          continue;
+        }
         if (Update.write(buf, bytes) != bytes) {
           LOG_ERROR("Update.write failed");
           success = false;
@@ -345,7 +408,7 @@ bool downloadAndVerify(const String& url, const String& expectedHash, int maxRet
     mbedtls_sha256_finish(&sha256_ctx, hash);
     mbedtls_sha256_free(&sha256_ctx);
     char hex[65];
-    for (int i = 0; i < 32; i++) sprintf(hex + i*2, "%02x", hash[i]);
+    for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", hash[i]);
     String computedHash = String(hex);
 
     if (!expectedHash.isEmpty() && computedHash != expectedHash) {
@@ -419,37 +482,101 @@ void handleCheckUpdate() {
 
 void handleUpdateStatus() {
   String json = "{";
-  json += "\"available\":"; json += updateAvailable ? "true" : "false";
-  json += ",\"current\":\""; json += FW_VERSION_STR; json += "\"";
-  json += ",\"new\":\""; json += newVersion; json += "\"";
-  json += ",\"hash\":\""; json += newHash; json += "\"";
-  json += ",\"inProgress\":"; json += updateInProgress ? "true" : "false";
+  json += "\"available\":";
+  json += updateAvailable ? "true" : "false";
+  json += ",\"current\":\"";
+  json += FW_VERSION_STR;
+  json += "\"";
+  json += ",\"new\":\"";
+  json += newVersion;
+  json += "\"";
+  json += ",\"hash\":\"";
+  json += newHash;
+  json += "\"";
+  json += ",\"inProgress\":";
+  json += updateInProgress ? "true" : "false";
   json += "}";
   server.send(200, "application/json", json);
 }
 
 void handleTriggerUpdate() {
-  if (!updateAvailable) { server.send(400, "text/plain", "No update available"); return; }
-  if (updateInProgress) { server.send(409, "text/plain", "Update already in progress"); return; }
+  if (!updateAvailable) {
+    server.send(400, "text/plain", "No update available");
+    return;
+  }
+  if (updateInProgress) {
+    server.send(409, "text/plain", "Update already in progress");
+    return;
+  }
   server.send(200, "text/plain", "Update started");
-  performUpdate(); // will restart on success
+  performUpdate();  // will restart on success
 }
+
 
 void handleUpload() {
   static size_t total = 0;
+  static mbedtls_sha256_context sha256_ctx;
+  static bool hashInitialized = false;
+  static String expectedHash = "";   // store the expected hash
+
   HTTPUpload& upload = server.upload();
+
   if (upload.status == UPLOAD_FILE_START) {
     total = 0;
+    hashInitialized = false;
+    expectedHash = "";
+
+    // Try to fetch expected hash from version.txt (if WiFi connected)
+    if (WiFi.status() == WL_CONNECTED) {
+      String version, hash;
+      if (fetchVersionInfo(updateVersionUrl, version, hash)) {
+        expectedHash = hash;   // store the hash (may be empty)
+        LOG_INFO("Fetched expected hash: %s", expectedHash.c_str());
+      } else {
+        LOG_WARN("Could not fetch version info; proceeding without hash check");
+      }
+    } else {
+      LOG_INFO("No internet connection; skipping hash check");
+    }
+
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       LOG_ERROR("Update.begin failed");
       server.send(500, "text/plain", "Update begin failed");
+      return;
     }
+
+    mbedtls_sha256_init(&sha256_ctx);
+    mbedtls_sha256_starts(&sha256_ctx, 0);
+    hashInitialized = true;
+
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       LOG_ERROR("Update.write failed");
     }
+    if (hashInitialized) {
+      mbedtls_sha256_update(&sha256_ctx, upload.buf, upload.currentSize);
+    }
     total += upload.currentSize;
+
   } else if (upload.status == UPLOAD_FILE_END) {
+    uint8_t hash[32];
+    char hex[65];
+    if (hashInitialized) {
+      mbedtls_sha256_finish(&sha256_ctx, hash);
+      mbedtls_sha256_free(&sha256_ctx);
+      for (int i = 0; i < 32; i++) sprintf(hex + i*2, "%02x", hash[i]);
+      String computedHash = String(hex);
+      LOG_INFO("Uploaded file SHA-256: %s", computedHash.c_str());
+
+      // Compare with expected hash (if available)
+      if (!expectedHash.isEmpty() && computedHash != expectedHash) {
+        LOG_ERROR("Hash mismatch! Expected: %s, got: %s", expectedHash.c_str(), computedHash.c_str());
+        Update.abort();
+        server.send(400, "text/plain", "Hash mismatch – update rejected");
+        return;
+      }
+    }
+
     if (Update.end()) {
       LOG_SUCCESS("Uploaded %u bytes, rebooting...", total);
       server.send(200, "text/plain", "Update success, rebooting...");
@@ -473,32 +600,62 @@ void handleMove() {
 
 void handleClick() {
   String btn = server.arg("btn");
-  if (btn == "right") { Mouse.click(MOUSE_RIGHT); LOG_INFO("Mouse click right"); }
-  else if (btn == "middle") { Mouse.click(MOUSE_MIDDLE); LOG_INFO("Mouse click middle"); }
-  else { Mouse.click(MOUSE_LEFT); LOG_INFO("Mouse click left"); }
+  if (btn == "right") {
+    Mouse.click(MOUSE_RIGHT);
+    LOG_INFO("Mouse click right");
+  } else if (btn == "middle") {
+    Mouse.click(MOUSE_MIDDLE);
+    LOG_INFO("Mouse click middle");
+  } else {
+    Mouse.click(MOUSE_LEFT);
+    LOG_INFO("Mouse click left");
+  }
   server.send(200, "text/plain", "OK");
 }
 
 void handleDoubleClick() {
   String btn = server.arg("btn");
-  if (btn == "right") { Mouse.click(MOUSE_RIGHT); delay(50); Mouse.click(MOUSE_RIGHT); LOG_INFO("Mouse double click right"); }
-  else { Mouse.click(MOUSE_LEFT); delay(50); Mouse.click(MOUSE_LEFT); LOG_INFO("Mouse double click left"); }
+  if (btn == "right") {
+    Mouse.click(MOUSE_RIGHT);
+    delay(50);
+    Mouse.click(MOUSE_RIGHT);
+    LOG_INFO("Mouse double click right");
+  } else {
+    Mouse.click(MOUSE_LEFT);
+    delay(50);
+    Mouse.click(MOUSE_LEFT);
+    LOG_INFO("Mouse double click left");
+  }
   server.send(200, "text/plain", "OK");
 }
 
 void handleDown() {
   String btn = server.arg("btn");
-  if (btn == "right") { Mouse.press(MOUSE_RIGHT); LOG_INFO("Mouse press right"); }
-  else if (btn == "middle") { Mouse.press(MOUSE_MIDDLE); LOG_INFO("Mouse press middle"); }
-  else { Mouse.press(MOUSE_LEFT); LOG_INFO("Mouse press left"); }
+  if (btn == "right") {
+    Mouse.press(MOUSE_RIGHT);
+    LOG_INFO("Mouse press right");
+  } else if (btn == "middle") {
+    Mouse.press(MOUSE_MIDDLE);
+    LOG_INFO("Mouse press middle");
+  } else {
+    Mouse.press(MOUSE_LEFT);
+    LOG_INFO("Mouse press left");
+  }
   server.send(200, "text/plain", "OK");
 }
 
 void handleUp() {
   String btn = server.arg("btn");
-  if (btn == "right") { Mouse.release(MOUSE_RIGHT); LOG_INFO("Mouse release right"); }
-  else if (btn == "middle") { Mouse.release(MOUSE_MIDDLE); LOG_INFO("Mouse release middle"); }
-  else { Mouse.release(MOUSE_LEFT); LOG_INFO("Mouse release left"); }
+  if (btn == "right") {
+    Mouse.release(MOUSE_RIGHT);
+    LOG_INFO("Mouse release right");
+  } else if (btn == "middle") {
+    Mouse.release(MOUSE_MIDDLE);
+    LOG_INFO("Mouse release middle");
+  } else {
+    Mouse.release(MOUSE_LEFT);
+    LOG_INFO("Mouse release left");
+  }
   server.send(200, "text/plain", "OK");
 }
 
@@ -514,7 +671,8 @@ void handleSetSensitivity() {
   float val = server.arg("value").toFloat();
   if (val < 0.1f) val = 0.1f;
   if (val > 10.0f) val = 10.0f;
-  sensitivity = val; saveSettings();
+  sensitivity = val;
+  saveSettings();
   LOG_INFO("Sensitivity set to %.1f", sensitivity);
   server.send(200, "text/plain", "OK");
 }
@@ -523,28 +681,32 @@ void handleSetRepeatInterval() {
   int val = server.arg("value").toInt();
   if (val < 20) val = 20;
   if (val > 1000) val = 1000;
-  repeatInterval = val; saveSettings();
+  repeatInterval = val;
+  saveSettings();
   LOG_INFO("Repeat interval set to %d ms", repeatInterval);
   server.send(200, "text/plain", "OK");
 }
 
 void handleSetLegacyMode() {
   int val = server.arg("value").toInt();
-  legacyMode = (val == 1); saveSettings();
+  legacyMode = (val == 1);
+  saveSettings();
   LOG_INFO("Legacy mode set to %d", legacyMode);
   server.send(200, "text/plain", "OK");
 }
 
 void handleSetBootProtocol() {
   int val = server.arg("value").toInt();
-  bootProtocolMode = (val == 1); saveSettings();
+  bootProtocolMode = (val == 1);
+  saveSettings();
   LOG_INFO("Boot protocol mode set to %d", bootProtocolMode);
   server.send(200, "text/plain", "OK");
 }
 
 void handleSetGyro() {
   int val = server.arg("value").toInt();
-  gyroEnabled = (val == 1); saveSettings();
+  gyroEnabled = (val == 1);
+  saveSettings();
   LOG_INFO("Gyro mouse control set to %d", gyroEnabled);
   server.send(200, "text/plain", "OK");
 }
@@ -553,7 +715,8 @@ void handleSetTxPower() {
   int val = server.arg("value").toInt();
   if (val < 0) val = 0;
   if (val > 20) val = 20;
-  txPower = val; saveSettings();
+  txPower = val;
+  saveSettings();
   applyTxPower();
   LOG_INFO("TX power set to %d dBm", txPower);
   server.send(200, "text/plain", "OK");
@@ -561,7 +724,8 @@ void handleSetTxPower() {
 
 void handleSetPowerSave() {
   int val = server.arg("value").toInt();
-  powerSaveEnabled = (val == 1); saveSettings();
+  powerSaveEnabled = (val == 1);
+  saveSettings();
   applyPowerSave();
   LOG_INFO("Power save set to %d", powerSaveEnabled);
   server.send(200, "text/plain", "OK");
@@ -599,11 +763,16 @@ void handleConsumer() {
     delay(20);
     ConsumerControl.release();
     LOG_INFO("Consumer: POWER");
-  } else if (key == "INPUT") {
+  } else if (key == "INPUT_MENU") {
+    ConsumerControl.press(CONSUMER_INPUT_MENU);
+    delay(20);
+    ConsumerControl.release();
+    LOG_INFO("Consumer: INPUT_MENU");
+  } else if (key == "INPUT_SELECT") {
     ConsumerControl.press(CONSUMER_INPUT_SELECT);
     delay(20);
     ConsumerControl.release();
-    LOG_INFO("Consumer: INPUT");
+    LOG_INFO("Consumer: INPUT_SELECT");
   } else {
     LOG_WARN("Unknown consumer key: %s", key.c_str());
     server.send(400, "text/plain", "Invalid key");
@@ -614,8 +783,12 @@ void handleConsumer() {
 
 void handleType() {
   String text = server.arg("text");
-  String asciiText; asciiText.reserve(text.length());
-  for (size_t i = 0; i < text.length(); i++) { char c = text.charAt(i); if (c >= 32 && c <= 126) asciiText += c; }
+  String asciiText;
+  asciiText.reserve(text.length());
+  for (size_t i = 0; i < text.length(); i++) {
+    char c = text.charAt(i);
+    if (c >= 32 && c <= 126) asciiText += c;
+  }
   LOG_INFO("Typing text: %s", asciiText.c_str());
   applyModifiers();
   for (size_t i = 0; i < asciiText.length(); i++) {
@@ -636,17 +809,26 @@ void handleType() {
 void handleKeyTap() {
   String key = server.arg("key");
   uint8_t code = keyNameToCode(key);
-  if (code != 0) { sendKeyTap(code); LOG_INFO("Key tap request: %s (0x%02X)", key.c_str(), code); }
-  else LOG_WARN("Unknown key: %s", key.c_str());
+  if (code != 0) {
+    sendKeyTap(code);
+    LOG_INFO("Key tap request: %s (0x%02X)", key.c_str(), code);
+  } else LOG_WARN("Unknown key: %s", key.c_str());
   server.send(200, "text/plain", "OK");
 }
 
 void handleKeyDown() {
   String key = server.arg("key");
   uint8_t code = keyNameToCode(key);
-  if (code == 0) { LOG_WARN("Unknown key down: %s", key.c_str()); server.send(200, "text/plain", "OK"); return; }
+  if (code == 0) {
+    LOG_WARN("Unknown key down: %s", key.c_str());
+    server.send(200, "text/plain", "OK");
+    return;
+  }
   if (isModifierCode(code)) modifierHeldDown(code);
-  else { applyModifiers(); Keyboard.press(code); }
+  else {
+    applyModifiers();
+    Keyboard.press(code);
+  }
   LOG_INFO("Key down: %s (0x%02X)", key.c_str(), code);
   server.send(200, "text/plain", "OK");
 }
@@ -654,20 +836,33 @@ void handleKeyDown() {
 void handleKeyUp() {
   String key = server.arg("key");
   uint8_t code = keyNameToCode(key);
-  if (code == 0) { LOG_WARN("Unknown key up: %s", key.c_str()); server.send(200, "text/plain", "OK"); return; }
+  if (code == 0) {
+    LOG_WARN("Unknown key up: %s", key.c_str());
+    server.send(200, "text/plain", "OK");
+    return;
+  }
   if (isModifierCode(code)) modifierHeldUp(code);
-  else { Keyboard.release(code); applyModifiers(); }
+  else {
+    Keyboard.release(code);
+    applyModifiers();
+  }
   LOG_INFO("Key up: %s (0x%02X)", key.c_str(), code);
   server.send(200, "text/plain", "OK");
 }
 
 void handleToggleModifier() {
   String mod = server.arg("mod");
-  if (!toggleModifier(mod)) { server.send(400, "text/plain", "Invalid modifier"); return; }
+  if (!toggleModifier(mod)) {
+    server.send(400, "text/plain", "Invalid modifier");
+    return;
+  }
   server.send(200, "text/plain", "OK");
 }
 
-void handleResetModifiers() { releaseAllModifiers(); server.send(200, "text/plain", "OK"); }
+void handleResetModifiers() {
+  releaseAllModifiers();
+  server.send(200, "text/plain", "OK");
+}
 
 // ------------------- STA functions (unchanged) -------------------
 void setSTAErrorFromStatus() {
@@ -692,28 +887,50 @@ void updateSTAStatus(bool logStatus = false) {
     String currentIP = WiFi.localIP().toString();
     String currentSSID = WiFi.SSID();
     bool changed = sta_status != "Connected" || sta_ip != currentIP || sta_ssid != currentSSID;
-    sta_status = "Connected"; sta_ip = currentIP; sta_ssid = currentSSID; sta_error = ""; connecting = false; retryPending = false; sta_retry_count = 0;
+    sta_status = "Connected";
+    sta_ip = currentIP;
+    sta_ssid = currentSSID;
+    sta_error = "";
+    connecting = false;
+    retryPending = false;
+    sta_retry_count = 0;
     if (logStatus || changed) LOG_SUCCESS("STA connected to %s, IP %s", sta_ssid.c_str(), sta_ip.c_str());
     return;
   }
-  sta_ip = ""; sta_ssid = "";
-  if (connecting) { sta_status = "Connecting..."; setSTAErrorFromStatus(); if (millis() - connectStartTime > CONNECT_TIMEOUT) sta_error = "Connection timeout"; }
-  else if (retryPending) { sta_status = "Retrying..."; sta_error = "Retry scheduled"; }
-  else { sta_status = "Disconnected"; setSTAErrorFromStatus(); }
+  sta_ip = "";
+  sta_ssid = "";
+  if (connecting) {
+    sta_status = "Connecting...";
+    setSTAErrorFromStatus();
+    if (millis() - connectStartTime > CONNECT_TIMEOUT) sta_error = "Connection timeout";
+  } else if (retryPending) {
+    sta_status = "Retrying...";
+    sta_error = "Retry scheduled";
+  } else {
+    sta_status = "Disconnected";
+    setSTAErrorFromStatus();
+  }
   if (logStatus) LOG_WARN("STA status: %s, error: %s", sta_status.c_str(), sta_error.c_str());
 }
 
 void WiFiEvent(WiFiEvent_t event) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      if (connecting) { sta_status = "Connecting..."; sta_error = "Connected, waiting for IP..."; }
+      if (connecting) {
+        sta_status = "Connecting...";
+        sta_error = "Connected, waiting for IP...";
+      }
       LOG_INFO("STA connected to AP, waiting for IP");
       break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       updateSTAStatus(true);
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      if (!retryPending) { if (connecting) sta_status = "Connecting..."; else sta_status = "Disconnected"; setSTAErrorFromStatus(); }
+      if (!retryPending) {
+        if (connecting) sta_status = "Connecting...";
+        else sta_status = "Disconnected";
+        setSTAErrorFromStatus();
+      }
       LOG_WARN("STA disconnected: %s", sta_error.c_str());
       break;
     default: break;
@@ -725,20 +942,39 @@ bool parseBSSID(const String& text, uint8_t out[6]) {
   unsigned int b[6];
   int result = sscanf(text.c_str(), "%2x:%2x:%2x:%2x:%2x:%2x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]);
   if (result != 6) return false;
-  for (int i = 0; i < 6; i++) { if (b[i] > 255) return false; out[i] = (uint8_t)b[i]; }
+  for (int i = 0; i < 6; i++) {
+    if (b[i] > 255) return false;
+    out[i] = (uint8_t)b[i];
+  }
   return true;
 }
 
 void connectSTA(String ssid, String password, bool hidden, String bssid_str, bool resetRetries = true) {
-  if (ssid.length() == 0) { LOG_ERROR("connectSTA called with empty SSID"); return; }
-  if (WiFi.status() == WL_CONNECTED) { LOG_WARN("connectSTA aborted: already connected"); return; }
-  if (connecting) { LOG_WARN("connectSTA aborted: connection already in progress"); return; }
-  if (resetRetries) { sta_retry_count = 0; retryPending = false; }
-  if (WiFi.status() != WL_IDLE_STATUS && WiFi.status() != WL_DISCONNECTED) { WiFi.disconnect(); delay(50); }
+  if (ssid.length() == 0) {
+    LOG_ERROR("connectSTA called with empty SSID");
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    LOG_WARN("connectSTA aborted: already connected");
+    return;
+  }
+  if (connecting) {
+    LOG_WARN("connectSTA aborted: connection already in progress");
+    return;
+  }
+  if (resetRetries) {
+    sta_retry_count = 0;
+    retryPending = false;
+  }
+  if (WiFi.status() != WL_IDLE_STATUS && WiFi.status() != WL_DISCONNECTED) {
+    WiFi.disconnect();
+    delay(50);
+  }
   int scanState = WiFi.scanComplete();
   if (scanState >= 0) WiFi.scanDelete();
   scanInProgress = false;
-  WiFi.disconnect(); delay(50);
+  WiFi.disconnect();
+  delay(50);
   WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoReconnect(false);
   preferences.begin("wifi", false);
@@ -748,13 +984,22 @@ void connectSTA(String ssid, String password, bool hidden, String bssid_str, boo
   if (hidden) preferences.putString("bssid", bssid_str);
   else preferences.putString("bssid", "");
   preferences.end();
-  connecting = true; retryPending = false; connectStartTime = millis(); lastRetryTime = millis();
-  sta_error = "Connecting..."; sta_status = "Connecting..."; sta_ip = ""; sta_ssid = "";
+  connecting = true;
+  retryPending = false;
+  connectStartTime = millis();
+  lastRetryTime = millis();
+  sta_error = "Connecting...";
+  sta_status = "Connecting...";
+  sta_ip = "";
+  sta_ssid = "";
   LOG_INFO("Connecting to STA: %s (hidden=%d, bssid=%s, attempt=%d)", ssid.c_str(), hidden, bssid_str.c_str(), sta_retry_count + 1);
   if (hidden && bssid_str.length() > 0) {
     uint8_t bssid[6];
     if (parseBSSID(bssid_str, bssid)) WiFi.begin(ssid.c_str(), password.c_str(), 0, bssid);
-    else { LOG_WARN("Invalid BSSID format: %s; connecting without BSSID", bssid_str.c_str()); WiFi.begin(ssid.c_str(), password.c_str()); }
+    else {
+      LOG_WARN("Invalid BSSID format: %s; connecting without BSSID", bssid_str.c_str());
+      WiFi.begin(ssid.c_str(), password.c_str());
+    }
   } else WiFi.begin(ssid.c_str(), password.c_str());
 }
 
@@ -765,21 +1010,32 @@ void loadSTAConfig() {
   bool hidden = preferences.getBool("hidden", false);
   String bssid = preferences.getString("bssid", "");
   preferences.end();
-  if (ssid.length() > 0) { LOG_INFO("Loading saved STA config: %s", ssid.c_str()); connectSTA(ssid, pass, hidden, bssid, true); }
-  else LOG_INFO("No saved STA config found");
+  if (ssid.length() > 0) {
+    LOG_INFO("Loading saved STA config: %s", ssid.c_str());
+    connectSTA(ssid, pass, hidden, bssid, true);
+  } else LOG_INFO("No saved STA config found");
 }
 
 void disconnectSTA() {
-  retryPending = false; connecting = false; sta_retry_count = 0; scanInProgress = false;
+  retryPending = false;
+  connecting = false;
+  sta_retry_count = 0;
+  scanInProgress = false;
   int scanState = WiFi.scanComplete();
   if (scanState >= 0) WiFi.scanDelete();
-  WiFi.disconnect(); WiFi.mode(WIFI_AP);
-  sta_status = "Disconnected"; sta_ip = ""; sta_ssid = ""; sta_error = "Disconnected";
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP);
+  sta_status = "Disconnected";
+  sta_ip = "";
+  sta_ssid = "";
+  sta_error = "Disconnected";
   LOG_INFO("STA disconnected manually");
 }
 
 void forgetSTA() {
-  preferences.begin("wifi", false); preferences.clear(); preferences.end();
+  preferences.begin("wifi", false);
+  preferences.clear();
+  preferences.end();
   disconnectSTA();
   LOG_INFO("STA credentials forgotten");
 }
@@ -787,28 +1043,58 @@ void forgetSTA() {
 void handleSTAStatus() {
   updateSTAStatus(false);
   String json = "{";
-  json += "\"connected\":"; json += (WiFi.status() == WL_CONNECTED ? "true" : "false");
-  json += ",\"ssid\":\""; json += jsonEscape(sta_ssid); json += "\"";
-  json += ",\"ip\":\""; json += jsonEscape(sta_ip); json += "\"";
-  json += ",\"status\":\""; json += jsonEscape(sta_status); json += "\"";
-  json += ",\"error\":\""; json += jsonEscape(sta_error); json += "\"";
+  json += "\"connected\":";
+  json += (WiFi.status() == WL_CONNECTED ? "true" : "false");
+  json += ",\"ssid\":\"";
+  json += jsonEscape(sta_ssid);
+  json += "\"";
+  json += ",\"ip\":\"";
+  json += jsonEscape(sta_ip);
+  json += "\"";
+  json += ",\"status\":\"";
+  json += jsonEscape(sta_status);
+  json += "\"";
+  json += ",\"error\":\"";
+  json += jsonEscape(sta_error);
+  json += "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
 
 void handleSTAScan() {
-  if (connecting) { server.send(409, "application/json", "{\"error\":\"Cannot scan while connecting\"}"); return; }
+  if (connecting) {
+    server.send(409, "application/json", "{\"error\":\"Cannot scan while connecting\"}");
+    return;
+  }
   int n = WiFi.scanComplete();
-  if (n == WIFI_SCAN_RUNNING) { scanInProgress = true; server.send(200, "application/json", "{\"scanning\":true}"); return; }
+  if (n == WIFI_SCAN_RUNNING) {
+    scanInProgress = true;
+    server.send(200, "application/json", "{\"scanning\":true}");
+    return;
+  }
   if (n == WIFI_SCAN_FAILED) {
-    if (scanInProgress) { scanInProgress = false; LOG_ERROR("WiFi scan failed"); server.send(503, "application/json", "{\"error\":\"WiFi scan failed\"}"); return; }
-    WiFi.mode(WIFI_AP_STA); LOG_INFO("Starting WiFi scan..."); scanInProgress = true;
+    if (scanInProgress) {
+      scanInProgress = false;
+      LOG_ERROR("WiFi scan failed");
+      server.send(503, "application/json", "{\"error\":\"WiFi scan failed\"}");
+      return;
+    }
+    WiFi.mode(WIFI_AP_STA);
+    LOG_INFO("Starting WiFi scan...");
+    scanInProgress = true;
     int result = WiFi.scanNetworks(true, true);
-    if (result == WIFI_SCAN_FAILED) { scanInProgress = false; LOG_ERROR("Failed to start WiFi scan"); server.send(503, "application/json", "{\"error\":\"WiFi scan failed to start\"}"); return; }
-    server.send(200, "application/json", "{\"scanning\":true}"); return;
+    if (result == WIFI_SCAN_FAILED) {
+      scanInProgress = false;
+      LOG_ERROR("Failed to start WiFi scan");
+      server.send(503, "application/json", "{\"error\":\"WiFi scan failed to start\"}");
+      return;
+    }
+    server.send(200, "application/json", "{\"scanning\":true}");
+    return;
   }
   if (n >= 0) {
-    String json = "["; json.reserve((size_t)n * 130 + 4);
+    String json = "[";
+    json.reserve((size_t)n * 130 + 4);
     for (int i = 0; i < n; i++) {
       if (i > 0) json += ",";
       String ssid = WiFi.SSID(i);
@@ -831,15 +1117,22 @@ void handleSTAScan() {
 #endif
         default: encType = "Unknown"; break;
       }
-      json += "{\"ssid\":\""; json += jsonEscape(ssid);
-      json += "\",\"rssi\":"; json += String(rssi);
-      json += ",\"encryption\":"; json += String((int)encryption);
-      json += ",\"bssid\":\""; json += jsonEscape(bssid);
-      json += "\",\"encryption_str\":\""; json += jsonEscape(encType); json += "\"}";
+      json += "{\"ssid\":\"";
+      json += jsonEscape(ssid);
+      json += "\",\"rssi\":";
+      json += String(rssi);
+      json += ",\"encryption\":";
+      json += String((int)encryption);
+      json += ",\"bssid\":\"";
+      json += jsonEscape(bssid);
+      json += "\",\"encryption_str\":\"";
+      json += jsonEscape(encType);
+      json += "\"}";
     }
     json += "]";
     LOG_INFO("WiFi scan completed, %d networks found", n);
-    scanInProgress = false; WiFi.scanDelete();
+    scanInProgress = false;
+    WiFi.scanDelete();
     server.send(200, "application/json", json);
     return;
   }
@@ -854,17 +1147,39 @@ void handleSTAConnect() {
   String hiddenStr = server.arg("hidden");
   String bssid = server.arg("bssid");
   bool hidden = hiddenStr == "1" || hiddenStr == "true";
-  ssid.trim(); bssid.trim();
-  if (ssid.length() == 0) { LOG_ERROR("STA connect called with empty SSID"); server.send(400, "text/plain", "SSID required"); return; }
-  if (connecting || WiFi.status() == WL_CONNECTED) { server.send(409, "text/plain", "STA already connected or connecting"); return; }
-  if (hidden && bssid.length() > 0) { uint8_t temp[6]; if (!parseBSSID(bssid, temp)) { server.send(400, "text/plain", "Invalid BSSID"); return; } }
+  ssid.trim();
+  bssid.trim();
+  if (ssid.length() == 0) {
+    LOG_ERROR("STA connect called with empty SSID");
+    server.send(400, "text/plain", "SSID required");
+    return;
+  }
+  if (connecting || WiFi.status() == WL_CONNECTED) {
+    server.send(409, "text/plain", "STA already connected or connecting");
+    return;
+  }
+  if (hidden && bssid.length() > 0) {
+    uint8_t temp[6];
+    if (!parseBSSID(bssid, temp)) {
+      server.send(400, "text/plain", "Invalid BSSID");
+      return;
+    }
+  }
   LOG_INFO("STA connect request: ssid=%s, hidden=%d, bssid=%s", ssid.c_str(), hidden, bssid.c_str());
   connectSTA(ssid, password, hidden, bssid, true);
   server.send(200, "text/plain", "OK");
 }
 
-void handleSTADisconnect() { LOG_INFO("STA disconnect request"); disconnectSTA(); server.send(200, "text/plain", "OK"); }
-void handleSTAForget() { LOG_INFO("STA forget request"); forgetSTA(); server.send(200, "text/plain", "OK"); }
+void handleSTADisconnect() {
+  LOG_INFO("STA disconnect request");
+  disconnectSTA();
+  server.send(200, "text/plain", "OK");
+}
+void handleSTAForget() {
+  LOG_INFO("STA forget request");
+  forgetSTA();
+  server.send(200, "text/plain", "OK");
+}
 
 void handleLogs() {
   String json = "[";
@@ -873,9 +1188,14 @@ void handleLogs() {
     int idx = (start + i) % MAX_LOG_ENTRIES;
     if (i) json += ",";
     json += "{";
-    json += "\"timestamp\":"; json += String(logBuffer[idx].timestamp);
-    json += ",\"level\":\""; json += jsonEscape(String(logBuffer[idx].level)); json += "\"";
-    json += ",\"message\":\""; json += jsonEscape(String(logBuffer[idx].message)); json += "\"";
+    json += "\"timestamp\":";
+    json += String(logBuffer[idx].timestamp);
+    json += ",\"level\":\"";
+    json += jsonEscape(String(logBuffer[idx].level));
+    json += "\"";
+    json += ",\"message\":\"";
+    json += jsonEscape(String(logBuffer[idx].message));
+    json += "\"";
     json += "}";
   }
   json += "]";
@@ -902,7 +1222,9 @@ const uint8_t HID_KP_0 = 0x62;
 const uint8_t HID_KP_DOT = 0x63;
 
 uint8_t keyNameToCode(const String& key) {
-  String k = key; k.trim(); k.toUpperCase();
+  String k = key;
+  k.trim();
+  k.toUpperCase();
   if (k == "ENTER") return KEY_RETURN;
   if (k == "BACKSPACE") return KEY_BACKSPACE;
   if (k == "TAB") return KEY_TAB;
@@ -971,7 +1293,7 @@ void sendKeyTap(uint8_t keycode) {
     delay(legacyMode ? 40 : 20);
     Keyboard.release(keycode);
     if (bootProtocolMode) {
-      Keyboard.releaseAll(); // send empty report
+      Keyboard.releaseAll();  // send empty report
       delay(5);
     }
   }
@@ -981,10 +1303,12 @@ void sendKeyTap(uint8_t keycode) {
 // ------------------- WebSocket -------------------
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   if (type == WStype_TEXT) {
-    String msg; msg.reserve(length + 1);
+    String msg;
+    msg.reserve(length + 1);
     for (size_t i = 0; i < length; i++) msg += (char)payload[i];
     msg.trim();
-    int dx = 0; int dy = 0;
+    int dx = 0;
+    int dy = 0;
     if (sscanf(msg.c_str(), "{\"dx\":%d,\"dy\":%d}", &dx, &dy) == 2) {
       dx = clamp(dx, -127, 127);
       dy = clamp(dy, -127, 127);
@@ -1003,12 +1327,24 @@ int selectBestChannel() {
   int attempts = 0;
   while (WiFi.scanComplete() == WIFI_SCAN_RUNNING && attempts++ < 30) delay(100);
   n = WiFi.scanComplete();
-  if (n <= 0) { WiFi.scanDelete(); return 1; }
+  if (n <= 0) {
+    WiFi.scanDelete();
+    return 1;
+  }
   int channelCount[12] = { 0 };
-  for (int i = 0; i < n; i++) { int ch = WiFi.channel(i); if (ch >= 1 && ch <= 11) channelCount[ch]++; }
+  for (int i = 0; i < n; i++) {
+    int ch = WiFi.channel(i);
+    if (ch >= 1 && ch <= 11) channelCount[ch]++;
+  }
   WiFi.scanDelete();
-  int best = 1; int minCount = channelCount[1];
-  for (int ch = 2; ch <= 11; ch++) { if (channelCount[ch] < minCount) { minCount = channelCount[ch]; best = ch; } }
+  int best = 1;
+  int minCount = channelCount[1];
+  for (int ch = 2; ch <= 11; ch++) {
+    if (channelCount[ch] < minCount) {
+      minCount = channelCount[ch];
+      best = ch;
+    }
+  }
   return best;
 }
 
@@ -1019,7 +1355,7 @@ void checkIdleSleep() {
     if (idleSleepActive) {
       // wake up: increase CPU freq, disable power save if needed
       setCpuFrequencyMhz(240);
-      applyPowerSave(); // reapply user setting
+      applyPowerSave();  // reapply user setting
       idleSleepActive = false;
       LOG_INFO("Exited idle sleep (STA active)");
     }
@@ -1033,7 +1369,7 @@ void checkIdleSleep() {
     if (!idleSleepActive && (millis() - lastClientActivity > 60000)) {
       // enter light sleep: reduce CPU, enable power save
       setCpuFrequencyMhz(80);
-      esp_wifi_set_ps(WIFI_PS_MAX_MODEM); // maximum power save
+      esp_wifi_set_ps(WIFI_PS_MAX_MODEM);  // maximum power save
       idleSleepActive = true;
       LOG_INFO("Entered idle sleep (no clients)");
     }
@@ -1041,11 +1377,11 @@ void checkIdleSleep() {
     // clients connected, wake up if needed
     if (idleSleepActive) {
       setCpuFrequencyMhz(240);
-      applyPowerSave(); // restore user setting
+      applyPowerSave();  // restore user setting
       idleSleepActive = false;
       LOG_INFO("Exited idle sleep (client connected)");
     }
-    lastClientActivity = millis(); // reset timer
+    lastClientActivity = millis();  // reset timer
   }
 }
 
@@ -1056,7 +1392,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>ESP32 HID Controller v6</title>
+<title>ESP32 HID Controller</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',Roboto,sans-serif;background:#0b0b0b;color:#eee;padding:12px;min-height:100vh}
@@ -1125,7 +1461,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:#5b9aff}
 <div class="container">
 <div class="card full-width">
 <div style="display:flex;justify-content:space-between;align-items:center;">
-<h2 style="margin:0;">⚡ ESP32 HID Controller v6</h2>
+<h2 style="margin:0;">⚡ ESP32 HID Controller</h2>
 <a href="/sta" style="color:#5b9aff;font-size:20px;text-decoration:none;">📶</a>
 </div>
 <div class="sta-status" id="staStatus">
@@ -1221,7 +1557,10 @@ input[type=text]:focus,input[type=password]:focus{border-color:#5b9aff}
 </div>
 <div class="btn-group">
 <button class="media" onclick="consumer('POWER')">⏻ Power</button>
-<button class="media" onclick="consumer('INPUT')">📡 Input</button>
+</div>
+<div class="btn-group">
+  <button class="media" onclick="consumer('INPUT_MENU')">📡 Menu</button>
+  <button class="media" onclick="consumer('INPUT_SELECT')">📡 Select</button>
 </div>
 <div class="small">Send consumer control commands (volume, channel, etc.)</div>
 </div>
@@ -1241,7 +1580,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:#5b9aff}
 <button type="submit">Upload & Update</button>
 </form>
 </div>
-<div class="small">Current version: 5.0.0</div>
+<div class="small" id="versionDisplay">Current version: loading...</div>
 </div>
 </div>
 <script>
@@ -1761,11 +2100,50 @@ function checkUpdate() {
 }
 
 function loadCurrentUrls() {
-  // we could fetch, but we just set placeholders
-  document.getElementById('verUrl').value = 'https://example.com/version.txt';
-  document.getElementById('binUrl').value = 'https://example.com/firmware.bin';
+  fetch('/get_urls', { cache: 'no-store' })
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById('verUrl').value = data.verUrl || 'https://raw.githubusercontent.com/Aminiow/ESP32-HID-Web-Remote-Controller/main/version.txt';
+      document.getElementById('binUrl').value = data.binUrl || 'https://raw.githubusercontent.com/Aminiow/ESP32-HID-Web-Remote-Controller/main/firmware.bin';
+    })
+    .catch(() => {
+      // Fallback to defaults if fetch fails
+      document.getElementById('verUrl').value = 'https://raw.githubusercontent.com/Aminiow/ESP32-HID-Web-Remote-Controller/main/version.txt';
+      document.getElementById('binUrl').value = 'https://raw.githubusercontent.com/Aminiow/ESP32-HID-Web-Remote-Controller/main/firmware.bin';
+    });
 }
 loadCurrentUrls();
+// Update version display from /update_status
+function updateVersionDisplay() {
+  fetch('/update_status', { cache: 'no-store' })
+    .then(res => res.json())
+    .then(data => {
+      const version = data.current || '?';
+      // Update the footer
+      const versionEl = document.getElementById('versionDisplay');
+      if (versionEl) {
+        versionEl.textContent = 'Current version: ' + version;
+      }
+      // Update the page title
+      document.title = 'ESP32 HID Controller v' + version;
+      // Update the main heading
+      const heading = document.getElementById('mainHeading');
+      if (heading) {
+        heading.textContent = '⚡ ESP32 HID Controller v' + version;
+      }
+    })
+    .catch(() => {
+      // If fetch fails, leave the defaults (or show '?' )
+      document.title = 'ESP32 HID Controller';
+      const heading = document.getElementById('mainHeading');
+      if (heading) {
+        heading.textContent = '⚡ ESP32 HID Controller';
+      }
+    });
+}
+
+// Call it on page load and after each update status poll
+updateVersionDisplay();
 
 // ---------- Automatic update check on page load ----------
 function checkUpdateStatus() {
@@ -1977,18 +2355,30 @@ window.onload = function() { setTimeout(scanNetworks, 500); };
 </html>
 )rawliteral";
 
-void handleRoot() { server.send(200, "text/html", index_html); }
-void handleSTA() { server.send(200, "text/html", sta_html); }
+void handleRoot() {
+  server.send(200, "text/html", index_html);
+}
+void handleSTA() {
+  server.send(200, "text/html", sta_html);
+}
+
+void handleGetUpdateUrls() {
+  String json = "{";
+  json += "\"verUrl\":\"" + jsonEscape(updateVersionUrl) + "\",";
+  json += "\"binUrl\":\"" + jsonEscape(updateBinUrl) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
 
 // ------------------- Setup & Loop -------------------
 void setup() {
   Serial.begin(115200);
   delay(100);
-  LOG_INFO("ESP32 HID Controller v6 starting...");
+  LOG_INFO("ESP32 HID Controller v%s starting...", FW_VERSION_STR);
   USB.begin();
   Keyboard.begin();
   Mouse.begin();
-  ConsumerControl.begin();   // new
+  ConsumerControl.begin();  // new
   LOG_INFO("USB HID initialised (Keyboard, Mouse, ConsumerControl)");
   loadSettings();
   loadUpdateUrls();
@@ -2048,9 +2438,12 @@ void setup() {
   server.on("/check_update", handleCheckUpdate);
   server.on("/update_status", handleUpdateStatus);
   server.on("/trigger_update", handleTriggerUpdate);
-  server.on("/upload", HTTP_POST, []() {
-    server.send(200, "text/plain", "Update " + (Update.hasError() ? "failed" : "success"));
-  }, handleUpload);
+  server.on(
+    "/upload", HTTP_POST, []() {
+      server.send(200, "text/plain", String("Update ") + (Update.hasError() ? "failed" : "success"));
+    },
+    handleUpload);
+  server.on("/get_urls", handleGetUpdateUrls);
   server.onNotFound([apIP]() {
     server.sendHeader("Location", "http://" + apIP.toString() + "/", true);
     server.send(302, "text/plain", "");
