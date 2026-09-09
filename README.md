@@ -1,6 +1,6 @@
-# ESP32-HID-Web-Remote-Controller - V5
+# ESP32-HID-Web-Remote-Controller - V6
 
-**ESP32‑S3 Wi‑Fi to USB HID bridge with web‑based mouse/keyboard control, captive portal, STA/AP mode, auto‑channel selection, and hidden SSID.**  
+**ESP32‑S3 Wi‑Fi to USB HID bridge with web‑based mouse/keyboard control, captive portal, STA/AP mode, auto‑channel selection, hidden SSID, and **over‑the‑air (OTA) firmware updates**.**  
 Control your computer or TV wirelessly from your phone or tablet – settings survive power cycles.
 
 [![GitHub release](https://img.shields.io/github/v/release/Aminiow/ESP32-HID-Web-Remote-Controller)](https://github.com/Aminiow/ESP32-HID-Web-Remote-Controller/releases)
@@ -22,11 +22,12 @@ Control your computer or TV wirelessly from your phone or tablet – settings su
 - 🔁 **Automatic retry** – if STA connection fails, it will retry up to 3 times with a configurable delay.
 - 🔗 **Captive Portal** – any DNS request resolves to the ESP32; any HTTP request **redirects** to the web UI (HTTP 302).
 - 📱 **Responsive Web Interface** – works on phones, tablets, and desktops; touch‑friendly with a mouse pad.
-- 📊 **On‑board logging** – view logs in the web UI to help debug; raw logs available at `/logs` (JSON‑escaped).
+- 📊 **On‑board logging** – view logs in the web UI to help debug; raw logs available at `/logs` (JSON).
 - 🎛 **Adjustable Settings** – sensitivity, repeat interval, and legacy mode (slower key presses for older hosts) – settings are saved automatically with debounced HTTP requests.
 - ⚡ **USB HID** – uses TinyUSB to emulate a standard USB mouse and keyboard – works out‑of‑the‑box on most OSes (Windows, macOS, Linux, Android, smart TVs).
 - 🔄 **Robust USB enumeration** – `USB.begin()` is called first, ensuring the host detects the device reliably.
 - 🛡 **JSON escaping** – all API responses are properly JSON‑escaped to prevent injection.
+- 🚀 **Over‑the‑Air (OTA) Firmware Updates** – check for new firmware from a remote server, download and verify with SHA‑256, then reboot. Also supports manual upload of `.bin` files via the web UI.
 
 ---
 
@@ -52,6 +53,10 @@ Required libraries (install via Arduino Library Manager or PlatformIO):
 - `USBHIDMouse` (built‑in)
 - `USBHIDKeyboard` (built‑in)
 - `Preferences` (built‑in)
+- `HTTPClient` (built‑in)
+- `Update` (built‑in)
+- `WiFiClientSecure` (built‑in)
+- `mbedtls` (built‑in)
 
 ---
 
@@ -120,6 +125,10 @@ After flashing, the ESP32 will create the Wi‑Fi network **ESP32-Mouse** (passw
 - **Real‑time input** – type live; backspace works.
 - **Settings** – sensitivity and repeat interval sliders, legacy mode checkbox (slower key timing). Settings are saved automatically to flash with debounce (400ms).
 - **Logs** – view client‑side logs; raw logs available at `/logs` (JSON).
+- **Firmware Update** – (New in v6)
+  - Set the URLs for a version file and a firmware binary file (e.g., hosted on a web server).
+  - Click **Check for Update** – the ESP32 will fetch the remote version, compare it with the current one (`5.0.0`), and if newer, download and verify the firmware using SHA‑256 before updating.
+  - Alternatively, you can manually upload a `.bin` file using the file picker and **Upload & Update** button – this performs the update immediately.
 
 ### Wi‑Fi STA (Client) Mode
 
@@ -158,13 +167,21 @@ The ESP32 automatically scans nearby networks at boot and selects the least crow
 
 ### USB Enumeration Order
 
-V5 uses the proven order:
+v6 uses the proven order:
 ```cpp
 USB.begin();
 Keyboard.begin();
 Mouse.begin();
 ```
 This ensures the host detects the device reliably on the first attempt, even on older TVs and computers.
+
+### Firmware Update URLs
+
+The update mechanism requires two URLs:
+- **Version URL** – points to a plain text file containing the version string (e.g., `5.0.1`) and optionally a SHA‑256 hash of the firmware binary on the next line.
+- **Binary URL** – points to the actual firmware `.bin` file.
+
+Both URLs are stored in Preferences and can be changed via the web UI or the `/set_urls` endpoint. The update check runs automatically once per day when STA is connected.
 
 ---
 
@@ -179,6 +196,7 @@ This ensures the host detects the device reliably on the first attempt, even on 
 | **STA connection fails / retries** | Check the SSID and password. The ESP32 will retry up to 3 times. If it still fails, check the logs at `/logs` for details. |
 | **Settings not saved** | Ensure the Preferences namespace has enough space (default should be fine). Settings are saved to flash – they persist across power‑cycles. |
 | **Wi‑Fi scan doesn't show networks** | Make sure you are in range and that the ESP32’s antenna is connected. On the STA settings page, click “Refresh” if the scan times out. |
+| **Firmware update fails** | Check that the version URL returns a valid text file with the correct format. The binary URL must point to a valid `.bin` file. If the SHA‑256 hash is provided, it must match the downloaded file. Also ensure the ESP32 has a stable Internet connection (STA mode). |
 
 ---
 
