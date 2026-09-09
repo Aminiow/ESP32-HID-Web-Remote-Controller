@@ -1,4 +1,4 @@
-// v6
+// v7
 // Default SSID: ESP32-MOUSE
 // Default Password: 12345678
 // Default Setting:
@@ -12,6 +12,7 @@
 #include <USB.h>
 #include <USBHIDMouse.h>
 #include <USBHIDKeyboard.h>
+#include <USBHIDConsumerControl.h>   // new
 #include <Preferences.h>
 #include <cstdarg>
 #include <cstdio>
@@ -20,9 +21,13 @@
 #include <Update.h>
 #include <WiFiClientSecure.h>
 #include <mbedtls/sha256.h>
+#include <ESPmDNS.h>                // new
+#include <esp_wifi.h>               // for TX power & power save
+#include <esp_sleep.h>              // for sleep modes
 
 USBHIDMouse Mouse;
 USBHIDKeyboard Keyboard;
+USBHIDConsumerControl ConsumerControl;   // new
 WebServer server(80);
 DNSServer dnsServer;
 WebSocketsServer webSocket(81);
@@ -34,6 +39,8 @@ const char* ap_password = "12345678";
 float sensitivity = 2.0f;
 int repeatInterval = 100;
 bool legacyMode = false;
+bool bootProtocolMode = false;        // new: keyboard compatibility
+bool gyroEnabled = false;            // new: gyro mouse control
 
 bool ctrlSticky = false;
 bool altSticky = false;
@@ -67,7 +74,17 @@ bool staStarted = false;
 String updateVersionUrl = "";
 String updateBinUrl = "";
 bool updateInProgress = false;
+bool updateAvailable = false;          // new
+String newVersion = "";
+String newHash = "";
 
+// Wi‑Fi power settings
+int8_t txPower = 20;                  // in dBm, default 20
+bool powerSaveEnabled = true;         // enable modem sleep
+bool idleSleepActive = false;         // flag for light sleep state
+unsigned long lastClientActivity = 0; // for idle detection
+
+// Log buffer
 #define MAX_LOG_ENTRIES 200
 struct LogEntry {
   unsigned long timestamp;
@@ -184,12 +201,19 @@ void loadSettings() {
   sensitivity = preferences.getFloat("sens", 2.0f);
   repeatInterval = preferences.getInt("repeat", 100);
   legacyMode = preferences.getBool("legacy", false);
+  bootProtocolMode = preferences.getBool("bootproto", false);
+  gyroEnabled = preferences.getBool("gyro", false);
+  txPower = preferences.getInt("txpwr", 20);
+  powerSaveEnabled = preferences.getBool("psave", true);
   preferences.end();
   if (sensitivity < 0.1f) sensitivity = 0.1f;
   if (sensitivity > 10.0f) sensitivity = 10.0f;
   if (repeatInterval < 20) repeatInterval = 20;
   if (repeatInterval > 1000) repeatInterval = 1000;
-  LOG_INFO("Settings loaded: sens=%.1f, repeat=%d, legacy=%d", sensitivity, repeatInterval, legacyMode);
+  if (txPower < 0) txPower = 0;
+  if (txPower > 20) txPower = 20;
+  LOG_INFO("Settings loaded: sens=%.1f, repeat=%d, legacy=%d, bootproto=%d, gyro=%d, txpwr=%d, psave=%d",
+           sensitivity, repeatInterval, legacyMode, bootProtocolMode, gyroEnabled, txPower, powerSaveEnabled);
 }
 
 void saveSettings() {
@@ -197,8 +221,31 @@ void saveSettings() {
   preferences.putFloat("sens", sensitivity);
   preferences.putInt("repeat", repeatInterval);
   preferences.putBool("legacy", legacyMode);
+  preferences.putBool("bootproto", bootProtocolMode);
+  preferences.putBool("gyro", gyroEnabled);
+  preferences.putInt("txpwr", txPower);
+  preferences.putBool("psave", powerSaveEnabled);
   preferences.end();
   LOG_INFO("Settings saved");
+}
+
+// ------------------- Wi‑Fi power functions -------------------
+void applyTxPower() {
+  int8_t val = txPower * 4; // 0.25 dBm steps
+  if (val > 84) val = 84;
+  if (val < 0) val = 0;
+  esp_wifi_set_max_tx_power(val);
+  LOG_INFO("TX power set to %d dBm", txPower);
+}
+
+void applyPowerSave() {
+  if (powerSaveEnabled) {
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    LOG_INFO("Wi‑Fi power save enabled (modem sleep)");
+  } else {
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    LOG_INFO("Wi‑Fi power save disabled");
+  }
 }
 
 // ------------------- Update URL storage -------------------
@@ -239,7 +286,7 @@ bool downloadAndVerify(const String& url, const String& expectedHash, int maxRet
   for (int attempt = 1; attempt <= maxRetries; attempt++) {
     LOG_INFO("Download attempt %d/%d", attempt, maxRetries);
     WiFiClientSecure client;
-    client.setInsecure(); // For testing; in production use proper certificate validation
+    client.setInsecure();
     HTTPClient http;
     http.begin(client, url);
     http.setTimeout(30000);
@@ -328,21 +375,32 @@ void checkAndUpdate() {
   }
   if (remoteVersion == FW_VERSION_STR) {
     LOG_INFO("Firmware up to date (%s)", FW_VERSION_STR);
+    updateAvailable = false;
     return;
   }
-  LOG_INFO("New version %s available, updating...", remoteVersion.c_str());
+  updateAvailable = true;
+  newVersion = remoteVersion;
+  newHash = remoteHash;
+  LOG_INFO("New version %s available", remoteVersion.c_str());
+}
+
+bool performUpdate() {
+  if (!updateAvailable) return false;
   updateInProgress = true;
-  if (downloadAndVerify(updateBinUrl, remoteHash, 3)) {
+  if (downloadAndVerify(updateBinUrl, newHash, 3)) {
     LOG_SUCCESS("Update successful, rebooting...");
     delay(1000);
     ESP.restart();
+    return true;
   } else {
     LOG_ERROR("Update failed after retries.");
     updateInProgress = false;
+    updateAvailable = false;
+    return false;
   }
 }
 
-// ------------------- Web Handlers (new) -------------------
+// ------------------- Web Handlers -------------------
 void handleSetUpdateUrls() {
   String ver = server.arg("ver");
   String bin = server.arg("bin");
@@ -357,6 +415,24 @@ void handleSetUpdateUrls() {
 void handleCheckUpdate() {
   server.send(200, "text/plain", "Check started");
   checkAndUpdate();
+}
+
+void handleUpdateStatus() {
+  String json = "{";
+  json += "\"available\":"; json += updateAvailable ? "true" : "false";
+  json += ",\"current\":\""; json += FW_VERSION_STR; json += "\"";
+  json += ",\"new\":\""; json += newVersion; json += "\"";
+  json += ",\"hash\":\""; json += newHash; json += "\"";
+  json += ",\"inProgress\":"; json += updateInProgress ? "true" : "false";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleTriggerUpdate() {
+  if (!updateAvailable) { server.send(400, "text/plain", "No update available"); return; }
+  if (updateInProgress) { server.send(409, "text/plain", "Update already in progress"); return; }
+  server.send(200, "text/plain", "Update started");
+  performUpdate(); // will restart on success
 }
 
 void handleUpload() {
@@ -386,7 +462,6 @@ void handleUpload() {
   }
 }
 
-// ------------------- Existing Handlers (unchanged) -------------------
 void handleMove() {
   int dx = server.arg("dx").toInt();
   int dy = server.arg("dy").toInt();
@@ -460,6 +535,83 @@ void handleSetLegacyMode() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleSetBootProtocol() {
+  int val = server.arg("value").toInt();
+  bootProtocolMode = (val == 1); saveSettings();
+  LOG_INFO("Boot protocol mode set to %d", bootProtocolMode);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetGyro() {
+  int val = server.arg("value").toInt();
+  gyroEnabled = (val == 1); saveSettings();
+  LOG_INFO("Gyro mouse control set to %d", gyroEnabled);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetTxPower() {
+  int val = server.arg("value").toInt();
+  if (val < 0) val = 0;
+  if (val > 20) val = 20;
+  txPower = val; saveSettings();
+  applyTxPower();
+  LOG_INFO("TX power set to %d dBm", txPower);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetPowerSave() {
+  int val = server.arg("value").toInt();
+  powerSaveEnabled = (val == 1); saveSettings();
+  applyPowerSave();
+  LOG_INFO("Power save set to %d", powerSaveEnabled);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleConsumer() {
+  String key = server.arg("key");
+  if (key == "VOLUME_UP") {
+    ConsumerControl.press(CONSUMER_VOLUME_INCREMENT);
+    delay(20);
+    ConsumerControl.release();
+    LOG_INFO("Consumer: VOLUME_UP");
+  } else if (key == "VOLUME_DOWN") {
+    ConsumerControl.press(CONSUMER_VOLUME_DECREMENT);
+    delay(20);
+    ConsumerControl.release();
+    LOG_INFO("Consumer: VOLUME_DOWN");
+  } else if (key == "MUTE") {
+    ConsumerControl.press(CONSUMER_MUTE);
+    delay(20);
+    ConsumerControl.release();
+    LOG_INFO("Consumer: MUTE");
+  } else if (key == "CHANNEL_UP") {
+    ConsumerControl.press(CONSUMER_CHANNEL_INCREMENT);
+    delay(20);
+    ConsumerControl.release();
+    LOG_INFO("Consumer: CHANNEL_UP");
+  } else if (key == "CHANNEL_DOWN") {
+    ConsumerControl.press(CONSUMER_CHANNEL_DECREMENT);
+    delay(20);
+    ConsumerControl.release();
+    LOG_INFO("Consumer: CHANNEL_DOWN");
+  } else if (key == "POWER") {
+    ConsumerControl.press(CONSUMER_POWER);
+    delay(20);
+    ConsumerControl.release();
+    LOG_INFO("Consumer: POWER");
+  } else if (key == "INPUT") {
+    ConsumerControl.press(CONSUMER_INPUT_SELECT);
+    delay(20);
+    ConsumerControl.release();
+    LOG_INFO("Consumer: INPUT");
+  } else {
+    LOG_WARN("Unknown consumer key: %s", key.c_str());
+    server.send(400, "text/plain", "Invalid key");
+    return;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
 void handleType() {
   String text = server.arg("text");
   String asciiText; asciiText.reserve(text.length());
@@ -471,6 +623,11 @@ void handleType() {
     Keyboard.press((uint8_t)c);
     delay(legacyMode ? 10 : 5);
     Keyboard.release((uint8_t)c);
+    if (bootProtocolMode) {
+      // send an empty report to ensure release
+      Keyboard.releaseAll();
+      delay(5);
+    }
     if (!legacyMode) delay(5);
   }
   server.send(200, "text/plain", "OK");
@@ -804,8 +961,20 @@ uint8_t keyNameToCode(const String& key) {
 }
 
 void sendKeyTap(uint8_t keycode) {
-  if (isModifierCode(keycode)) { modifierHeldDown(keycode); delay(legacyMode ? 40 : 20); modifierHeldUp(keycode); }
-  else { applyModifiers(); Keyboard.press(keycode); delay(legacyMode ? 40 : 20); Keyboard.release(keycode); }
+  if (isModifierCode(keycode)) {
+    modifierHeldDown(keycode);
+    delay(legacyMode ? 40 : 20);
+    modifierHeldUp(keycode);
+  } else {
+    applyModifiers();
+    Keyboard.press(keycode);
+    delay(legacyMode ? 40 : 20);
+    Keyboard.release(keycode);
+    if (bootProtocolMode) {
+      Keyboard.releaseAll(); // send empty report
+      delay(5);
+    }
+  }
   LOG_INFO("Key tap: 0x%02X", keycode);
 }
 
@@ -819,6 +988,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
     if (sscanf(msg.c_str(), "{\"dx\":%d,\"dy\":%d}", &dx, &dy) == 2) {
       dx = clamp(dx, -127, 127);
       dy = clamp(dy, -127, 127);
+      Mouse.move(dx, dy, 0);
+    } else if (sscanf(msg.c_str(), "{\"gyro\":%d,\"dx\":%d,\"dy\":%d}", &dx, &dy) == 2) {
+      // gyro message with dx,dy already scaled
       Mouse.move(dx, dy, 0);
     } else LOG_WARN("WebSocket unknown message: %s", msg.c_str());
   } else if (type == WStype_CONNECTED) LOG_INFO("WebSocket client connected, id=%u", num);
@@ -838,6 +1010,43 @@ int selectBestChannel() {
   int best = 1; int minCount = channelCount[1];
   for (int ch = 2; ch <= 11; ch++) { if (channelCount[ch] < minCount) { minCount = channelCount[ch]; best = ch; } }
   return best;
+}
+
+// ------------------- Idle sleep management -------------------
+void checkIdleSleep() {
+  if (WiFi.status() == WL_CONNECTED) {
+    // if STA connected, do not sleep (keep active)
+    if (idleSleepActive) {
+      // wake up: increase CPU freq, disable power save if needed
+      setCpuFrequencyMhz(240);
+      applyPowerSave(); // reapply user setting
+      idleSleepActive = false;
+      LOG_INFO("Exited idle sleep (STA active)");
+    }
+    lastClientActivity = millis();
+    return;
+  }
+
+  int connectedStations = WiFi.softAPgetStationNum();
+  if (connectedStations == 0) {
+    // no clients connected to AP, and no STA connection
+    if (!idleSleepActive && (millis() - lastClientActivity > 60000)) {
+      // enter light sleep: reduce CPU, enable power save
+      setCpuFrequencyMhz(80);
+      esp_wifi_set_ps(WIFI_PS_MAX_MODEM); // maximum power save
+      idleSleepActive = true;
+      LOG_INFO("Entered idle sleep (no clients)");
+    }
+  } else {
+    // clients connected, wake up if needed
+    if (idleSleepActive) {
+      setCpuFrequencyMhz(240);
+      applyPowerSave(); // restore user setting
+      idleSleepActive = false;
+      LOG_INFO("Exited idle sleep (client connected)");
+    }
+    lastClientActivity = millis(); // reset timer
+  }
 }
 
 // ------------------- HTML pages -------------------
@@ -869,6 +1078,8 @@ button.accent{background:#2c5f8a;border-color:#3a7bbd}
 button.accent:hover{background:#3a7bbd}
 button.mod-active{background:#f39c12;color:#000;border-color:#f1c40f}
 button.pressed{background:#f39c12;color:#000;border-color:#f1c40f}
+button.media{background:#2d4a3e;border-color:#3b6b5a}
+button.media:hover{background:#3b6b5a}
 #pad{width:100%;height:200px;background:#181818;border-radius:12px;border:2px solid #333;touch-action:none;cursor:crosshair;margin:10px 0}
 #pad:active{border-color:#5b9aff}
 .arrow-row{display:flex;justify-content:center;gap:6px;margin:4px 0}
@@ -931,6 +1142,17 @@ input[type=text]:focus,input[type=password]:focus{border-color:#5b9aff}
 <span class="slider-value" id="repeatVal">100</span>
 <label>Legacy</label>
 <input type="checkbox" id="legacyCheck">
+<label>BootProto</label>
+<input type="checkbox" id="bootprotoCheck">
+</div>
+<div class="slider-group">
+<label>TX Power (dBm)</label>
+<input type="range" id="txPower" min="0" max="20" step="1" value="20">
+<span class="slider-value" id="txPowerVal">20</span>
+<label>Power Save</label>
+<input type="checkbox" id="psaveCheck">
+<label>Gyro Mouse</label>
+<input type="checkbox" id="gyroCheck">
 </div>
 <div class="btn-group">
 <button onclick="testAll()">🧪 Test All</button>
@@ -987,9 +1209,26 @@ input[type=text]:focus,input[type=password]:focus{border-color:#5b9aff}
 <div id="numpad" class="numpad"></div>
 <div class="small">Sticky modifiers toggled via buttons above. Keyboard keys press/release on hold.</div>
 </div>
+<!-- Consumer Controls card -->
+<div class="card">
+<h3>🎛️ Media / TV</h3>
+<div class="btn-group">
+<button class="media" onclick="consumer('VOLUME_UP')">🔊 +</button>
+<button class="media" onclick="consumer('VOLUME_DOWN')">🔊 -</button>
+<button class="media" onclick="consumer('MUTE')">🔇 Mute</button>
+<button class="media" onclick="consumer('CHANNEL_UP')">📺 CH+</button>
+<button class="media" onclick="consumer('CHANNEL_DOWN')">📺 CH-</button>
+</div>
+<div class="btn-group">
+<button class="media" onclick="consumer('POWER')">⏻ Power</button>
+<button class="media" onclick="consumer('INPUT')">📡 Input</button>
+</div>
+<div class="small">Send consumer control commands (volume, channel, etc.)</div>
+</div>
 <!-- Firmware Update card (full width) -->
 <div class="card full-width">
 <h3>⚙️ Firmware Update</h3>
+<div id="updateStatus" style="text-align:center;padding:6px;color:#aaa;"></div>
 <div style="display:flex;flex-wrap:wrap;gap:10px;justify-content:center;align-items:center;">
 <input type="text" id="verUrl" placeholder="Version URL" style="flex:2;min-width:200px;">
 <input type="text" id="binUrl" placeholder="Firmware URL" style="flex:2;min-width:200px;">
@@ -1092,6 +1331,8 @@ function sendMove(dx, dy) {
 let sens = 2.0;
 let repeatInterval = 100;
 let legacyMode = false;
+let bootProto = false;
+let gyroEnabled = false;
 let sensSaveTimer = null, repeatSaveTimer = null;
 
 document.getElementById('sens').addEventListener('input', function() {
@@ -1118,6 +1359,70 @@ document.getElementById('legacyCheck').addEventListener('change', function() {
   legacyMode = this.checked;
   sendHTTP('/set_legacy?value=' + (legacyMode ? 1 : 0)).catch(() => {});
   logInfo('Legacy mode = ' + legacyMode);
+});
+
+document.getElementById('bootprotoCheck').addEventListener('change', function() {
+  bootProto = this.checked;
+  sendHTTP('/set_bootproto?value=' + (bootProto ? 1 : 0)).catch(() => {});
+  logInfo('Boot protocol mode = ' + bootProto);
+});
+
+document.getElementById('gyroCheck').addEventListener('change', function() {
+  gyroEnabled = this.checked;
+  sendHTTP('/set_gyro?value=' + (gyroEnabled ? 1 : 0)).catch(() => {});
+  if (gyroEnabled) {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      DeviceOrientationEvent.requestPermission().then(state => {
+        if (state === 'granted') {
+          window.addEventListener('deviceorientation', handleOrientation);
+          logInfo('Gyro permission granted');
+        } else {
+          alert('Gyro permission denied');
+          document.getElementById('gyroCheck').checked = false;
+          gyroEnabled = false;
+        }
+      }).catch(err => logError('Gyro permission error: ' + err));
+    } else {
+      window.addEventListener('deviceorientation', handleOrientation);
+      logInfo('Gyro enabled (no permission needed)');
+    }
+  } else {
+    window.removeEventListener('deviceorientation', handleOrientation);
+    logInfo('Gyro disabled');
+  }
+});
+
+let lastBeta = 0, lastGamma = 0;
+function handleOrientation(event) {
+  if (!gyroEnabled) return;
+  const beta = event.beta || 0;   // -180..180, tilt front/back
+  const gamma = event.gamma || 0; // -90..90, tilt left/right
+  // Convert to mouse movement: we want small movements based on tilt from neutral
+  // Neutral: beta=0 (device flat), gamma=0
+  // We'll scale: 1 degree = some pixels
+  const scale = 0.5; // adjust
+  const dx = Math.round(gamma * scale);
+  const dy = Math.round(beta * scale);
+  if (dx !== 0 || dy !== 0) {
+    // send via WebSocket with gyro flag
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send('{"gyro":1,"dx":' + clamp(dx, -127, 127) + ',"dy":' + clamp(dy, -127, 127) + '}');
+    } else {
+      sendHTTP('/move?dx=' + encodeURIComponent(clamp(dx, -127, 127)) + '&dy=' + encodeURIComponent(clamp(dy, -127, 127)));
+    }
+  }
+}
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+document.getElementById('txPower').addEventListener('input', function() {
+  const val = parseInt(this.value);
+  document.getElementById('txPowerVal').textContent = val;
+  sendHTTP('/set_txpower?value=' + val).catch(() => {});
+});
+
+document.getElementById('psaveCheck').addEventListener('change', function() {
+  const val = this.checked ? 1 : 0;
+  sendHTTP('/set_psave?value=' + val).catch(() => {});
 });
 
 function updateSTAStatus() {
@@ -1433,6 +1738,12 @@ async function testAll() {
 sendHTTP('/reset_modifiers').catch(() => {});
 logInfo('Modifiers reset');
 
+// ---------- Consumer controls ----------
+function consumer(key) {
+  sendHTTP('/consumer?key=' + key).catch(() => {});
+  logInfo('Consumer: ' + key);
+}
+
 // ---------- Update functions ----------
 function saveUrls() {
   const ver = document.getElementById('verUrl').value.trim();
@@ -1449,14 +1760,47 @@ function checkUpdate() {
     .catch(() => { alert('Failed to start update check.'); });
 }
 
-// Load current URLs into fields
 function loadCurrentUrls() {
-  // We could fetch from /get_urls, but we'll just rely on defaults.
-  // We'll fill with placeholders.
+  // we could fetch, but we just set placeholders
   document.getElementById('verUrl').value = 'https://example.com/version.txt';
   document.getElementById('binUrl').value = 'https://example.com/firmware.bin';
 }
 loadCurrentUrls();
+
+// ---------- Automatic update check on page load ----------
+function checkUpdateStatus() {
+  fetch('/update_status', { cache: 'no-store' })
+    .then(res => res.json())
+    .then(data => {
+      const statusDiv = document.getElementById('updateStatus');
+      if (data.available) {
+        statusDiv.innerHTML = '<span style="color:#f39c12;">⚠️ New version ' + data.new + ' available!</span> ' +
+          '<button onclick="triggerUpdate()">Update Now</button>';
+      } else {
+        statusDiv.textContent = '✅ Up to date (' + data.current + ')';
+      }
+      if (data.inProgress) {
+        statusDiv.innerHTML = '⏳ Update in progress...';
+      }
+    })
+    .catch(() => {});
+}
+
+function triggerUpdate() {
+  if (!confirm('Update to version ' + newVersion + '? This will reboot the device.')) return;
+  sendHTTP('/trigger_update')
+    .then(() => {
+      alert('Update started. Device will reboot.');
+    })
+    .catch(() => {
+      alert('Update trigger failed.');
+    });
+}
+
+// Poll for update status every 30 seconds
+setInterval(checkUpdateStatus, 30000);
+// Check on load
+checkUpdateStatus();
 
 </script>
 </body>
@@ -1644,7 +1988,8 @@ void setup() {
   USB.begin();
   Keyboard.begin();
   Mouse.begin();
-  LOG_INFO("USB HID initialised");
+  ConsumerControl.begin();   // new
+  LOG_INFO("USB HID initialised (Keyboard, Mouse, ConsumerControl)");
   loadSettings();
   loadUpdateUrls();
   WiFi.mode(WIFI_AP);
@@ -1653,6 +1998,19 @@ void setup() {
   WiFi.softAP(ap_ssid, ap_password, bestChannel, true);
   IPAddress apIP = WiFi.softAPIP();
   LOG_INFO("AP mode started, IP: %s", apIP.toString().c_str());
+
+  // mDNS
+  if (MDNS.begin("esp32-mouse")) {
+    MDNS.addService("http", "tcp", 80);
+    LOG_INFO("mDNS started: esp32-mouse.local");
+  } else {
+    LOG_WARN("mDNS failed");
+  }
+
+  // Apply Wi‑Fi power settings
+  applyTxPower();
+  applyPowerSave();
+
   dnsServer.start(53, "*", apIP);
   WiFi.onEvent(WiFiEvent);
 
@@ -1667,6 +2025,11 @@ void setup() {
   server.on("/set_sensitivity", handleSetSensitivity);
   server.on("/set_repeat", handleSetRepeatInterval);
   server.on("/set_legacy", handleSetLegacyMode);
+  server.on("/set_bootproto", handleSetBootProtocol);
+  server.on("/set_gyro", handleSetGyro);
+  server.on("/set_txpower", handleSetTxPower);
+  server.on("/set_psave", handleSetPowerSave);
+  server.on("/consumer", handleConsumer);
   server.on("/type", handleType);
   server.on("/key", handleKeyTap);
   server.on("/key_down", handleKeyDown);
@@ -1680,9 +2043,11 @@ void setup() {
   server.on("/sta/disconnect", handleSTADisconnect);
   server.on("/sta/forget", handleSTAForget);
   server.on("/logs", handleLogs);
-  // New update routes
+  // Update routes
   server.on("/set_urls", handleSetUpdateUrls);
   server.on("/check_update", handleCheckUpdate);
+  server.on("/update_status", handleUpdateStatus);
+  server.on("/trigger_update", handleTriggerUpdate);
   server.on("/upload", HTTP_POST, []() {
     server.send(200, "text/plain", "Update " + (Update.hasError() ? "failed" : "success"));
   }, handleUpload);
@@ -1694,6 +2059,14 @@ void setup() {
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
   LOG_INFO("Setup complete.");
+
+  // Delayed STA connection and update check
+  staStarted = true;
+  loadSTAConfig();
+  // check for updates after STA connects (or after a delay)
+  if (WiFi.status() == WL_CONNECTED) {
+    checkAndUpdate();
+  }
 }
 
 void loop() {
@@ -1749,12 +2122,15 @@ void loop() {
     }
   }
 
-  // Optional periodic update check (e.g., once per day)
+  // Periodic update check (once per day) and idle sleep management
   static unsigned long lastUpdateCheck = 0;
   if (WiFi.status() == WL_CONNECTED && millis() - lastUpdateCheck > 86400000UL) {
     checkAndUpdate();
     lastUpdateCheck = millis();
   }
+
+  // Idle sleep management
+  checkIdleSleep();
 
   delay(1);
 }
