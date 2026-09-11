@@ -1,4 +1,4 @@
-# ESP32-HID-Web-Remote-Controller - V8.0.1
+# ESP32-HID-Web-Remote-Controller - V8.0.0
 
 **ESP32‑S3 Wi‑Fi to USB HID bridge with web‑based mouse/keyboard control, captive portal, STA/AP mode, auto‑channel selection, hidden SSID, over‑the‑air (OTA) firmware updates, consumer controls (media keys), gyro mouse support, mDNS, Wi‑Fi power management, idle sleep, and **SHA‑256 verified firmware uploads**.**
 
