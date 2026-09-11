@@ -1,4 +1,4 @@
-// v8
+// v8.0.1
 // Default SSID: ESP32-MOUSE
 // Default Password: 12345678
 // Default Setting:
@@ -81,7 +81,7 @@ bool staStarted = false;
 #define FW_VERSION_MAJOR 8
 #define FW_VERSION_MINOR 0
 #define FW_VERSION_PATCH 0
-#define FW_VERSION_STR "8.0.0"
+#define FW_VERSION_STR "8.0.1"
 String updateVersionUrl = "";
 String updateBinUrl = "";
 bool updateInProgress = false;
@@ -302,8 +302,8 @@ void applyPowerSave() {
 // ------------------- Update URL storage -------------------
 void loadUpdateUrls() {
   preferences.begin("updates", true);
-  updateVersionUrl = preferences.getString("verUrl", "https://raw.githubusercontent.com/Aminiow/ESP32-HID-Web-Remote-Controller/main/version.txt");
-  updateBinUrl = preferences.getString("binUrl", "https://raw.githubusercontent.com/Aminiow/ESP32-HID-Web-Remote-Controller/main/firmware.bin");
+  updateVersionUrl = preferences.getString("verUrl", "https://github.com/Aminiow/ESP32-HID-Web-Remote-Controller/raw/refs/heads/main/version.txt");
+  updateBinUrl = preferences.getString("binUrl", "https://github.com/Aminiow/ESP32-HID-Web-Remote-Controller/raw/refs/heads/main/firmware.bin");
   preferences.end();
 }
 
