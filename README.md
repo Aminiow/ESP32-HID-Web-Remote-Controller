@@ -579,6 +579,97 @@ This is a **single‑file Arduino sketch** (`.ino`) that embeds HTML, CSS, and J
 
 ---
 
+🔮 Coming in v10 (Roadmap)
+
+The next major release focuses on UX polish, settings reliability, STA robustness, and configurability. All items below are already designed; final code + testing are in progress.
+
+✅ Settings & persistence
+
+· Fix: gyro / TX power / power‑save not reflecting after reload — values were saved correctly to NVS but the web UI never read them back on page load. v10 adds a /get_settings endpoint and a JS bootstrap that syncs every slider and checkbox on first paint.
+· New /get_settings API — returns all persisted settings in one JSON blob (sens, repeat, legacy, bootproto, gyro, txpwr, psave, ntp1..3, mdnsName, mdnsDom).
+· New /set_ntp and /set_mdns endpoints — persistent, no recompile needed.
+
+📺 Consumer / TV controls
+
+· New buttons: AV List, Back, Exit, Home (On/Off switch).
+· New HID usages added: CONSUMER_AV_LIST (0x183), CONSUMER_AC_BACK (0x224), CONSUMER_AC_EXIT (0x204), CONSUMER_HOME (0x223).
+· Media/TV card reorganised into three rows: Volume/Channel, Power/Home/AV List, Menu/Select/Back/Exit.
+
+🖱 Gyro mouse
+
+· Fixed UI state sync so the Gyro checkbox survives refresh.
+· Better permission handling feedback for iOS/Android browsers.
+· Documented how to check deviceorientation support (see /update page diagnostics — planned).
+
+📶 Wi‑Fi STA
+
+· Hidden SSID fix — connectSTA() now runs a targeted synchronous scan to discover the AP's channel before WiFi.begin(ssid, pass, channel, bssid). Previous builds passed channel 0, which fails on hidden networks.
+· Visible SSID "wait then refresh" fix — the radio is no longer left mid‑scan when WiFi.begin() is issued; the code waits for WIFI_SCAN_RUNNING to complete.
+· Saved channel persisted in NVS (wifi/chan) — retries reuse the discovered channel.
+· CONNECT_TIMEOUT raised to 15 s to accommodate hidden‑AP scans.
+
+🌐 NTP & mDNS
+
+· Configurable NTP servers (3 slots) via UI — no more hardcoded pool.ntp.org, ir.pool.ntp.org, ntp.time.ir.
+· Configurable mDNS hostname + domain — both parts editable (thispart + andthispart), e.g. esp32-mouse + local → esp32-mouse.local.
+· New settings UI section on /update: NTP 1/2/3 and mDNS name / domain rows.
+
+🕐 /update page
+
+· Manual UTC offset input — a ±HH:MM text field (e.g. +03:30, -1:00) beside the preset dropdown. Typing a custom value overrides the dropdown.
+· Online‑only gating — the Secure OTA, Insecure Retry, and Manual Upload buttons are disabled unless STA is connected. Polls /sta/status every 4 s. Offline attempts show a clear error instead of code -1 timeouts.
+· Clear offline error — replaced the ambiguous Root CA verification failed (code -1) with "STA not connected – connect to Wi‑Fi first."
+
+🔗 Root page (/)
+
+· Explicit /update button — a labelled ⬆ Update button next to 📶 WiFi. The old emoji‑only anchors were too small to tap on phones.
+· Settings sync on load — sliders, checkboxes, and toggles now reflect actual NVS state on every visit.
+
+🔐 TLS / OTA
+
+· Fingerprint + Root CA verification verified on both Arduino core 2.x and 3.x.
+  · Core 3.x → getFingerprintSHA256(uint8_t[32]) post‑handshake.
+  · Core 2.x → equivalent shim via the same helper.
+· RTC guard on all TLS calls — if time() hasn't synced, the request aborts with a clear log line ("TLS aborted: RTC not synced") instead of a generic code -1.
+· setHandshakeTimeout(30) added to all secure clients.
+· No offline OTA attempts — the three‑tier flow short‑circuits when STA is down.
+
+🖥️ USB device identity
+
+· Custom USB descriptors — the device now enumerates as ESP32-Remote-HID (manufacturer + product) instead of a generic ESP32‑S3, so hosts see it as a real HID peripheral.
+· Unique serial number derived from the eFuse MAC.
+· Applied on core 3.x via USB.manufacturerName() / USB.productName() / USB.serialNumber() before USB.begin().
+
+🎛️ TV / AV remote
+
+· Added On/Off switch (AC Home), AV List, Back, and Exit to the Media card — turning the page into a fuller TV remote.
+
+🐛 Fixes summary
+
+Issue Status in v10
+Gyro / TXpwr / psave not persisting in UI ✅ Fixed (/get_settings + JS sync)
+Hidden STA "SSID not found" ✅ Fixed (targeted sync scan)
+Visible STA slow / needs refresh ✅ Fixed (wait for scan complete)
+Offline OTA retries every tier ✅ Fixed (STA gate + RTC guard)
+No /update button on root ✅ Fixed (explicit button)
+Hardcoded UTC presets only ✅ Fixed (custom ±HH:MM input)
+Hardcoded NTP + mDNS ✅ Fixed (configurable, NVS)
+Generic USB device name ✅ Fixed (ESP32-Remote-HID descriptors)
+Missing AV/Back/Exit/Home consumer keys ✅ Fixed (new usages + UI)
+
+🔜 Planned beyond v10
+
+· Per‑device profiles for sensitivity / repeat (remember settings per host).
+· Optional LittleFS‑backed config export/import.
+· Bluetooth HID fallback on chips that support it (BLE HID alongside USB HID).
+· Web‑UI dark/light theme toggle persisted in localStorage.
+· OTA delta updates (only diffs downloaded) — experimental.
+· OpenAPI/JSON schema for the HTTP API so third‑party clients can auto‑discover endpoints.
+
+Note: v10 is still under active development. APIs are stable, but endpoint paths or JSON field names may change before release. Watch the releases page for the tag.
+
+---
+
 ## 📜 License
 
 MIT — see [LICENSE](LICENSE).
